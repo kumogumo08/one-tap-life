@@ -1,10 +1,16 @@
+import { DEFAULT_CHARACTER_ID, isCharacterId } from '@/src/data/characters';
+import { ensureOwnedCharacterId } from '@/src/lib/characterAccess';
+import type { CharacterId } from '@/src/types/character';
 import type { TaskLevel } from '@/src/types/task';
 
 export type { TaskLevel };
 
+/** 旧設定互換用。主データは selectedCharacterId */
 export type PraiseStyle = 'gal' | 'serious';
 
 export type UserSettings = {
+  selectedCharacterId: CharacterId;
+  /** @deprecated 旧データ互換。新規保存時は selectedCharacterId と同期 */
   praiseStyle: PraiseStyle;
   level: TaskLevel;
 };
@@ -31,9 +37,21 @@ export type HistoryItem = {
 export const AVAILABLE_TASK_LEVELS: TaskLevel[] = [1];
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
+  selectedCharacterId: DEFAULT_CHARACTER_ID,
   praiseStyle: 'gal',
   level: 1,
 };
+
+function praiseStyleFromCharacterId(id: CharacterId): PraiseStyle {
+  // 互換同期用：無料2キャラはそのまま、有料はデフォルト系に寄せる
+  return id === 'serious' ? 'serious' : 'gal';
+}
+
+function characterIdFromLegacyPraiseStyle(value: unknown): CharacterId {
+  if (value === 'serious') return 'serious';
+  if (value === 'gal') return 'gal';
+  return DEFAULT_CHARACTER_ID;
+}
 
 export const DEFAULT_DAILY_STATE = (dateKey: string): DailyState => ({
   dateKey,
@@ -63,10 +81,38 @@ export function normalizeUserSettings(value: unknown): UserSettings {
 
   const raw = value as Record<string, unknown>;
 
+  let candidateId: CharacterId;
+  if (isCharacterId(raw.selectedCharacterId)) {
+    candidateId = raw.selectedCharacterId;
+  } else {
+    candidateId = characterIdFromLegacyPraiseStyle(raw.praiseStyle);
+  }
+
+  // 未購入の有料キャラが保存されていても無料デフォルトへ
+  const selectedCharacterId = ensureOwnedCharacterId(candidateId);
+  const praiseStyle = isPraiseStyle(raw.praiseStyle)
+    ? raw.praiseStyle
+    : praiseStyleFromCharacterId(selectedCharacterId);
+
   return {
-    praiseStyle: isPraiseStyle(raw.praiseStyle) ? raw.praiseStyle : DEFAULT_USER_SETTINGS.praiseStyle,
+    selectedCharacterId,
+    praiseStyle,
     // 保存上の level は 1|2|3 を許容（将来解放時に好みを残す）。抽選は normalizeAvailableLevel を使う
     level: normalizeTaskLevel(raw.level),
+  };
+}
+
+/** 新規保存用。selectedCharacterId を主にし、praiseStyle も同期 */
+export function toSavableUserSettings(
+  settings: Pick<UserSettings, 'selectedCharacterId' | 'level'> & {
+    praiseStyle?: PraiseStyle;
+  }
+): UserSettings {
+  const selectedCharacterId = ensureOwnedCharacterId(settings.selectedCharacterId);
+  return {
+    selectedCharacterId,
+    praiseStyle: settings.praiseStyle ?? praiseStyleFromCharacterId(selectedCharacterId),
+    level: normalizeTaskLevel(settings.level),
   };
 }
 

@@ -1,16 +1,17 @@
 import React from 'react';
 import { Image, StyleSheet, Text, View } from 'react-native';
 
+import { DEFAULT_CHARACTER_ID, getCharacterById, isCharacterId } from '@/src/data/characters';
+import type { CharacterId } from '@/src/types/character';
+
 type Props = {
-  character: 'gal' | 'serious';
+  characterId: CharacterId;
   message: string;
 };
 
-export default function PraiseCharacter({ character, message }: Props) {
-  const characterImage =
-    character === 'gal'
-      ? require('../assets/images/praise/gal_v1.png')
-      : require('../assets/images/praise/serious_v1.png');
+export default function PraiseCharacter({ characterId, message }: Props) {
+  const safeId = isCharacterId(characterId) ? characterId : DEFAULT_CHARACTER_ID;
+  const character = getCharacterById(safeId);
 
   return (
     <View pointerEvents="none" style={styles.layer}>
@@ -20,7 +21,7 @@ export default function PraiseCharacter({ character, message }: Props) {
       </View>
 
       {/* 右下：キャラ */}
-      <Image source={characterImage} style={styles.character} />
+      <Image source={character.image} style={styles.character} />
     </View>
   );
 }

@@ -8,8 +8,10 @@ import { ThemedText } from '@/components/themed-text';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { GAL_PRAISES_LV1, SERIOUS_PRAISES_LV1 } from '@/src/data/praises';
+import { DEFAULT_CHARACTER_ID } from '@/src/data/characters';
+import { getRandomPraiseForCharacter } from '@/src/data/praises';
 import { getDescriptionByLabel } from '@/src/data/tasks';
+import { ensureOwnedCharacterId } from '@/src/lib/characterAccess';
 import { pickTask } from '@/src/lib/pickTask';
 import {
   defaultPremiumState,
@@ -19,7 +21,8 @@ import {
 } from '@/src/lib/premium';
 import { readJson, writeJson } from '@/src/lib/storage';
 import { STORAGE_KEYS } from '@/src/lib/storageKeys';
-import type { DailyState, HistoryItem, PraiseStyle, TaskLevel } from '@/src/types/storage';
+import type { CharacterId } from '@/src/types/character';
+import type { DailyState, HistoryItem, TaskLevel } from '@/src/types/storage';
 import {
   DEFAULT_DAILY_STATE,
   normalizeAvailableLevel,
@@ -83,16 +86,6 @@ const RAINBOW = [
   '#FF2D55',
 ];
 
-const pickPraise = (style: PraiseStyle = 'gal') => {
-  const source = style === 'serious' ? SERIOUS_PRAISES_LV1 : GAL_PRAISES_LV1;
-
-  if (!Array.isArray(source) || source.length === 0) {
-    return 'よくやりました。';
-  }
-
-  return source[Math.floor(Math.random() * source.length)];
-};
-
 function pad2(n: number) {
   return String(n).padStart(2, '0');
 }
@@ -139,7 +132,8 @@ export default function HomeScreen() {
   const phaseRef = useRef<Phase>('idle');
   const taskRef = useRef<string>('');
   const [typed, setTyped] = useState<string>('');
-  const [praiseStyle, setPraiseStyle] = useState<PraiseStyle>('gal');
+  const [selectedCharacterId, setSelectedCharacterId] =
+    useState<CharacterId>(DEFAULT_CHARACTER_ID);
   const [extraInProgress, setExtraInProgress] = useState(false);
   const [level, setLevel] = useState<TaskLevel>(1);
   const [ready, setReady] = useState(false);
@@ -150,8 +144,6 @@ export default function HomeScreen() {
   const descOpacity = useRef(new Animated.Value(0)).current;
 
   const [premiumState, setPremiumState] = useState<PremiumState>(defaultPremiumState);
-  const selectedCharacter: 'gal' | 'serious' =
-  praiseStyle === 'serious' ? 'serious' : 'gal';
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
@@ -248,7 +240,7 @@ export default function HomeScreen() {
           try {
             const rawSettings = await readJson<unknown>(STORAGE_KEYS.settings, null);
             const settings = normalizeUserSettings(rawSettings);
-            setPraiseStyle(settings.praiseStyle);
+            setSelectedCharacterId(ensureOwnedCharacterId(settings.selectedCharacterId));
             // 抽選・表示は公開版ゲート後のレベルのみ使う
             setLevel(normalizeAvailableLevel(settings.level));
           } catch {}
@@ -517,7 +509,7 @@ export default function HomeScreen() {
       setCanComplete(false);
     
       // ✅ 褒めタイピング：同じ文言でも必ず再生されるようにする
-      const msg = pickPraise(praiseStyle);
+      const msg = getRandomPraiseForCharacter(selectedCharacterId);
       setTypedPraise('');          // 表示を一旦消す
       setPraise(msg);              // 元文をセット
       setPraiseTick(t => t + 1);   // ✅ 同じmsgでも effect を必ず走らせる
@@ -736,7 +728,7 @@ if (!fontsLoaded) {
               {/* ✅ 画面下にキャラ＋吹き出し（タスク中だけ） */}
               {!!typedPraise && phase !== 'idle' && (
                 <View style={styles.praiseOverlay} pointerEvents="none">
-                  <PraiseCharacter character={selectedCharacter} message={typedPraise} />
+                  <PraiseCharacter characterId={selectedCharacterId} message={typedPraise} />
                 </View>
               )}
             </View>
