@@ -4,7 +4,7 @@ import type {
   CharacterPack,
   CharacterPackId,
 } from '@/src/types/character';
-import { CHARACTER_IDS } from '@/src/types/character';
+import { CHARACTER_IDS, CHARACTER_PACK_IDS } from '@/src/types/character';
 
 export const DEFAULT_CHARACTER_ID: CharacterId = 'gal';
 
@@ -16,7 +16,7 @@ export const CHARACTERS: readonly Character[] = [
     isPremium: false,
     image: require('../../assets/images/praise/gal_v1.png'),
     praiseStyleId: 'gal',
-    description: '元気に褒めてくれる無料キャラクター',
+    description: '明るくテンション高めに褒めてくれます',
   },
   {
     id: 'serious',
@@ -25,7 +25,7 @@ export const CHARACTERS: readonly Character[] = [
     isPremium: false,
     image: require('../../assets/images/praise/serious_v1.png'),
     praiseStyleId: 'serious',
-    description: '落ち着いて褒めてくれる無料キャラクター',
+    description: '落ち着いた言葉でしっかり褒めてくれます',
   },
   {
     id: 'mom',
@@ -33,8 +33,8 @@ export const CHARACTERS: readonly Character[] = [
     packId: 'family_pack',
     isPremium: true,
     image: require('../../assets/images/praise/mom.png'),
-    praiseStyleId: 'serious',
-    description: '応援ファミリーパックのキャラクター',
+    praiseStyleId: 'mom',
+    description: '優しく安心感のある言葉で応援してくれます',
   },
   {
     id: 'grandma',
@@ -42,8 +42,8 @@ export const CHARACTERS: readonly Character[] = [
     packId: 'family_pack',
     isPremium: true,
     image: require('../../assets/images/praise/grandma.png'),
-    praiseStyleId: 'serious',
-    description: '応援ファミリーパックのキャラクター',
+    praiseStyleId: 'grandma',
+    description: '包み込むような温かい言葉で褒めてくれます',
   },
   {
     id: 'tsundere_sister',
@@ -51,8 +51,8 @@ export const CHARACTERS: readonly Character[] = [
     packId: 'family_pack',
     isPremium: true,
     image: require('../../assets/images/praise/tsundere_sister.png'),
-    praiseStyleId: 'gal',
-    description: '応援ファミリーパックのキャラクター',
+    praiseStyleId: 'tsundere_sister',
+    description: '素直ではないけれど、しっかり認めてくれます',
   },
   {
     id: 'kansai_obachan',
@@ -60,8 +60,8 @@ export const CHARACTERS: readonly Character[] = [
     packId: 'family_pack',
     isPremium: true,
     image: require('../../assets/images/praise/kansai_obachan.png'),
-    praiseStyleId: 'gal',
-    description: '応援ファミリーパックのキャラクター',
+    praiseStyleId: 'kansai_obachan',
+    description: '明るい関西弁で元気いっぱいに応援してくれます',
   },
 ] as const;
 
@@ -90,6 +90,15 @@ export const CHARACTER_BY_ID: Record<CharacterId, Character> = CHARACTERS.reduce
   {} as Record<CharacterId, Character>
 );
 
+export const CHARACTER_PACK_BY_ID: Record<CharacterPackId, CharacterPack> =
+  CHARACTER_PACKS.reduce(
+    (acc, pack) => {
+      acc[pack.id] = pack;
+      return acc;
+    },
+    {} as Record<CharacterPackId, CharacterPack>
+  );
+
 export const FREE_CHARACTER_IDS: readonly CharacterId[] = CHARACTERS.filter(
   (c) => !c.isPremium
 ).map((c) => c.id);
@@ -107,5 +116,12 @@ export function getCharacterById(id: CharacterId): Character {
 }
 
 export function isCharacterPackId(value: unknown): value is CharacterPackId {
-  return value === 'free' || value === 'family_pack';
+  return (
+    typeof value === 'string' &&
+    (CHARACTER_PACK_IDS as readonly string[]).includes(value)
+  );
+}
+
+export function getCharacterPackById(id: CharacterPackId): CharacterPack {
+  return CHARACTER_PACK_BY_ID[id] ?? CHARACTER_PACK_BY_ID.free;
 }

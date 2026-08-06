@@ -1,7 +1,14 @@
 import type { ImageSourcePropType } from 'react-native';
 
-/** 既存褒め言葉セットへの参照キー（本文差し替え前の暫定ブリッジ） */
-export const PRAISE_STYLE_IDS = ['gal', 'serious'] as const;
+/** 褒め言葉セットへの参照キー（CharacterId とは別型。同一キャラで別口調を持てる余地を残す） */
+export const PRAISE_STYLE_IDS = [
+  'gal',
+  'serious',
+  'mom',
+  'grandma',
+  'tsundere_sister',
+  'kansai_obachan',
+] as const;
 export type PraiseStyleId = (typeof PRAISE_STYLE_IDS)[number];
 
 export const CHARACTER_IDS = [
@@ -23,7 +30,7 @@ export type Character = {
   packId: CharacterPackId;
   isPremium: boolean;
   image: ImageSourcePropType;
-  /** 既存褒め言葉データへの参照。将来はキャラ別配列へ差し替え可能 */
+  /** 褒め言葉セットへの参照。キャラ別配列への差し替えが可能 */
   praiseStyleId: PraiseStyleId;
   description?: string;
 };

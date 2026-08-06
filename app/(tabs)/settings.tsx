@@ -10,11 +10,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 
-import { CHARACTERS, DEFAULT_CHARACTER_ID } from '@/src/data/characters';
-import {
-  ensureOwnedCharacterId,
-  isCharacterOwned,
-} from '@/src/lib/characterAccess';
+import { DEFAULT_CHARACTER_ID, getCharacterById } from '@/src/data/characters';
+import { ensureOwnedCharacterId } from '@/src/lib/characterAccess';
 import {
   defaultPremiumState,
   getTrialActive,
@@ -39,6 +36,9 @@ export default function SettingsScreen() {
   const [selectedCharacterId, setSelectedCharacterId] =
     useState<CharacterId>(DEFAULT_CHARACTER_ID);
   const [level, setLevel] = useState<TaskLevel>(1);
+  const currentCharacter = getCharacterById(
+    ensureOwnedCharacterId(selectedCharacterId)
+  );
 
   const saveLevel = async (lv: TaskLevel) => {
     // 公開版では AVAILABLE のみ保存・表示（将来配列に 2,3 を足せば解放）
@@ -126,27 +126,11 @@ export default function SettingsScreen() {
     }, [])
   );
 
-  const saveCharacter = async (characterId: CharacterId) => {
-    if (!isCharacterOwned(characterId)) {
-      Alert.alert(
-        'プレミアムキャラクター',
-        'このキャラクターは応援ファミリーパックに含まれています。購入機能は今後追加予定です。'
-      );
-      return;
-    }
-
-    setSelectedCharacterId(characterId); // 先に反映
-
-    const current = normalizeUserSettings(
-      await readJson<unknown>(STORAGE_KEYS.settings, null)
-    );
-    const next = toSavableUserSettings({
-      selectedCharacterId: characterId,
-      level: current.level,
-    });
-    await writeJson(STORAGE_KEYS.settings, next);
+  const openCharacterSelect = () => {
+    // /characters/index は [packId]="index" に誤マッチするため使わない
+    router.push('/characters');
   };
-  
+
   const levelRow = (lv: TaskLevel, subtitle: string) => {
     const isActive = level === lv;
   
@@ -310,32 +294,21 @@ export default function SettingsScreen() {
         <View style={styles.section}>
           <ThemedText style={styles.sectionTitle}>褒めてくれるキャラクター</ThemedText>
 
-          {CHARACTERS.map((character) => {
-            const owned = isCharacterOwned(character.id);
-            const isActive = selectedCharacterId === character.id;
+          <View style={styles.currentCharacterCard}>
+            <Image source={currentCharacter.image} style={styles.currentCharacterImage} />
+            <ThemedText style={styles.currentCharacterName}>
+              {currentCharacter.name}
+            </ThemedText>
+            <ThemedText style={styles.currentCharacterStatus}>現在選択中</ThemedText>
+          </View>
 
-            return (
-              <Pressable
-                key={character.id}
-                onPress={() => saveCharacter(character.id)}
-                style={[styles.choiceBtn, isActive && styles.choiceBtnActive]}
-              >
-                <View style={styles.characterRow}>
-                  <Image source={character.image} style={styles.characterThumb} />
-                  <View style={styles.characterTextCol}>
-                    <ThemedText style={styles.choiceText}>
-                      {isActive ? '● ' : '○ '}
-                      {character.name}
-                      {!owned ? ' 🔒' : ''}
-                    </ThemedText>
-                    {!owned && (
-                      <ThemedText style={styles.premiumHint}>プレミアム</ThemedText>
-                    )}
-                  </View>
-                </View>
-              </Pressable>
-            );
-          })}
+          <Pressable
+            onPress={openCharacterSelect}
+            style={[styles.choiceBtn, { borderColor: theme.tint }]}
+            accessibilityRole="button"
+          >
+            <ThemedText style={styles.choiceText}>変更する</ThemedText>
+          </Pressable>
 
           <ThemedText style={styles.note}>
             ※ 完了時のひとことが変わります
@@ -432,25 +405,28 @@ const styles = StyleSheet.create({
   },
   choiceText: {
     fontWeight: '700',
+    textAlign: 'center',
   },
-  characterRow: {
-    flexDirection: 'row',
+  currentCharacterCard: {
     alignItems: 'center',
-    gap: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
+    gap: 6,
   },
-  characterThumb: {
-    width: 44,
-    height: 44,
+  currentCharacterImage: {
+    width: 96,
+    height: 96,
     resizeMode: 'contain',
   },
-  characterTextCol: {
-    flex: 1,
-    gap: 2,
+  currentCharacterName: {
+    fontWeight: '800',
+    fontSize: 18,
   },
-  premiumHint: {
+  currentCharacterStatus: {
     fontSize: 12,
-    opacity: 0.6,
-    marginLeft: 18,
+    opacity: 0.65,
   },
 
   levelCard: {

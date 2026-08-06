@@ -16,6 +16,9 @@ export default function RootLayout() {
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
       <Stack>
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        {/* ヘッダーは characters/_layout 側で出す（戻るボタン含む） */}
+        <Stack.Screen name="characters" options={{ headerShown: false }} />
+        <Stack.Screen name="premium" options={{ title: 'プレミアム' }} />
         <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
       </Stack>
       <StatusBar style="auto" />
