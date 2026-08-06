@@ -588,22 +588,13 @@ if (!fontsLoaded) {
     <ScreenWrapper>
       <SafeAreaView style={styles.safe}>
         <View style={styles.container}>
-          <CrackerBurst
-            tick={crackerTick}
-            origin={crackerOrigin}
-            tint={theme.tint}
-            palette={[
-              '#FF3B30',
-              '#FF9500',
-              '#FFCC00',
-              '#34C759',
-              '#007AFF',
-              '#5856D6',
-              '#AF52DE',
-              '#FF2D55',
-            ]}
-            count={20}
-          />
+        <CrackerBurst
+          tick={crackerTick}
+          origin={crackerOrigin}
+          tint={theme.tint}
+          palette={RAINBOW}
+          count={50}
+        />
   
           <View style={styles.header}>
             <ThemedText type="title" style={[styles.title, styles.textOutline]}>
@@ -743,116 +734,304 @@ export function CrackerBurst({
   tick,
   origin,
   tint,
-  count,
-  palette, // ✅ 追加
+  count = 100,
+  palette,
 }: CrackerBurstProps) {
   const [visible, setVisible] = useState(false);
 
-  // ✅ COUNTを先に定義
-  const COUNT = Math.min(18, Math.max(10, count ?? (10 + Math.floor(Math.random() * 9))));
+  // 端末負荷を考慮して最大120個
+  const COUNT = Math.min(120, Math.max(10, count));
 
-  // ✅ tickごとに色を固定
+  // 粒子ごとのアニメーション値
+  const particles = useMemo(
+    () =>
+      Array.from({ length: COUNT }, () => ({
+        x: new Animated.Value(0),
+        y: new Animated.Value(0),
+        r: new Animated.Value(0),
+        sway: new Animated.Value(0),
+        flutter: new Animated.Value(0),
+        o: new Animated.Value(0),
+        s: new Animated.Value(1),
+      })),
+    [COUNT]
+  );
+
+  // 粒子の色
   const colors = useMemo(() => {
-    const pal = palette && palette.length > 0 ? palette : RAINBOW;
-    return Array.from({ length: COUNT }).map((_, i) => pal[i % pal.length]);
-  }, [tick, COUNT, palette]);
+    const selectedPalette =
+      palette && palette.length > 0 ? palette : RAINBOW;
 
-  const particles = useMemo(() => {
-    return Array.from({ length: 18 }).map(() => ({
-      x: new Animated.Value(0),
-      y: new Animated.Value(0),
-      r: new Animated.Value(0),
-      o: new Animated.Value(0),
-      s: new Animated.Value(1),
-    }));
-  }, []);
+    return Array.from(
+      { length: COUNT },
+      (_, index) => selectedPalette[index % selectedPalette.length]
+    );
+  }, [COUNT, palette]);
 
   useEffect(() => {
     if (!tick) return;
 
     setVisible(true);
 
-    particles.forEach(p => {
-      p.x.setValue(0);
-      p.y.setValue(0);
-      p.r.setValue(0);
-      p.o.setValue(1);
-      p.s.setValue(1);
+    const animations = particles.map((particle) => {
+      // 前回のアニメーション状態をリセット
+      particle.x.setValue(0);
+      particle.y.setValue(0);
+      particle.r.setValue(0);
+      particle.sway.setValue(0);
+      particle.flutter.setValue(0);
+      particle.o.setValue(0);
+      particle.s.setValue(1);
+
+      // 上方向を中心に扇状に発射
+      const angle =
+        (-130 + Math.random() * 80) * (Math.PI / 180);
+
+      const speed = 280 + Math.random() * 220;
+      const wind = (Math.random() - 0.5) * 100;
+
+      const dx = Math.cos(angle) * speed + wind;
+      const initialDy = Math.sin(angle) * speed * 0.80;
+
+      // 下方向に落ちる距離
+      const fallDistance = 260 + Math.random() * 180;
+
+      // ほぼ同時に発射
+      const delay = Math.floor(Math.random() * 35);
+
+      // 上昇・落下時間
+      const riseDuration = 150 + Math.random() * 80;
+      const fallDuration = 1500 + Math.random() * 900;
+      const totalDuration = riseDuration + fallDuration;
+
+      // 平面回転は2〜5回転程度
+      const rotationDirection = Math.random() > 0.5 ? 1 : -1;
+      const rotation =
+        rotationDirection * (720 + Math.random() * 1080);
+
+      // ひらひらする速度
+      const flutterDuration = 220 + Math.random() * 180;
+
+      // 左右に揺れる距離
+      const swayDistance = 4 + Math.random() * 7;
+
+      // アニメーション全体をカバーする回数
+      const flutterIterations = Math.ceil(
+        totalDuration / (flutterDuration * 2)
+      );
+
+      return Animated.sequence([
+        Animated.delay(delay),
+
+        Animated.parallel([
+          // 表示
+          Animated.timing(particle.o, {
+            toValue: 1,
+            duration: 40,
+            useNativeDriver: true,
+          }),
+
+          // 横方向へ広がる
+          Animated.sequence([
+            // 発射直後に一気に広がる
+            Animated.timing(particle.x, {
+              toValue: dx * 0.62,
+              duration: riseDuration,
+              easing: Easing.out(Easing.exp),
+              useNativeDriver: true,
+            }),
+
+            // その後は惰性で少し移動
+            Animated.timing(particle.x, {
+              toValue: dx,
+              duration: fallDuration,
+              easing: Easing.out(Easing.cubic),
+              useNativeDriver: true,
+            }),
+          ]),
+
+            // 上昇後に落下
+            Animated.sequence([
+              Animated.timing(particle.y, {
+                toValue: initialDy,
+                duration: riseDuration,
+                easing: Easing.out(Easing.quad),
+                useNativeDriver: true,
+              }),
+
+              Animated.timing(particle.y, {
+                toValue: initialDy + fallDistance,
+                duration: fallDuration,
+                easing: Easing.in(Easing.quad),
+                useNativeDriver: true,
+              }),
+            ]),
+
+          // 平面上の回転
+          Animated.timing(particle.r, {
+            toValue: rotation,
+            duration: totalDuration,
+            easing: Easing.linear,
+            useNativeDriver: true,
+          }),
+
+          // 左右にゆらゆら揺れる
+          Animated.loop(
+            Animated.sequence([
+              Animated.timing(particle.sway, {
+                toValue: swayDistance,
+                duration: flutterDuration,
+                easing: Easing.inOut(Easing.sin),
+                useNativeDriver: true,
+              }),
+
+              Animated.timing(particle.sway, {
+                toValue: -swayDistance,
+                duration: flutterDuration * 1.1,
+                easing: Easing.inOut(Easing.sin),
+                useNativeDriver: true,
+              }),
+            ]),
+            {
+              iterations: flutterIterations,
+            }
+          ),
+
+          // 紙が表裏にひっくり返る
+          Animated.loop(
+            Animated.sequence([
+              Animated.timing(particle.flutter, {
+                toValue: 1,
+                duration: flutterDuration,
+                easing: Easing.inOut(Easing.sin),
+                useNativeDriver: true,
+              }),
+
+              Animated.timing(particle.flutter, {
+                toValue: -1,
+                duration: flutterDuration,
+                easing: Easing.inOut(Easing.sin),
+                useNativeDriver: true,
+              }),
+            ]),
+            {
+              iterations: flutterIterations,
+            }
+          ),
+
+          // 発射直後に少し大きくし、その後元に戻す
+          Animated.sequence([
+            Animated.timing(particle.s, {
+              toValue: 1.15,
+              duration: 150,
+              easing: Easing.out(Easing.quad),
+              useNativeDriver: true,
+            }),
+
+            Animated.timing(particle.s, {
+              toValue: 1,
+              duration: totalDuration - 150,
+              easing: Easing.out(Easing.quad),
+              useNativeDriver: true,
+            }),
+          ]),
+
+          // 終盤にフェードアウト
+          Animated.sequence([
+            Animated.delay(totalDuration * 0.72),
+
+            Animated.timing(particle.o, {
+              toValue: 0,
+              duration: totalDuration * 0.28,
+              useNativeDriver: true,
+            }),
+          ]),
+        ]),
+      ]);
     });
 
-    const anims: Animated.CompositeAnimation[] = [];
+    const animation = Animated.parallel(animations);
 
-    for (let i = 0; i < COUNT; i++) {
-      const p = particles[i];
+    animation.start(({ finished }) => {
+      if (finished) {
+        setVisible(false);
+      }
+    });
 
-      const angle = (-140 + Math.random() * 100) * (Math.PI / 180); // -140°〜-40°
-      const speed = 140 + Math.random() * 140; // 140〜280
-      const wind = (Math.random() - 0.5) * 40; // 散りも維持
-      const dx = Math.cos(angle) * speed + wind;
-      const dy = Math.sin(angle) * speed;
-
-      const gravity = 220 + Math.random() * 220; // 220〜440
-      const rot = Math.random() * 360 - 180;
-
-      anims.push(
-        Animated.parallel([
-          Animated.timing(p.x, { toValue: dx, duration: 900, useNativeDriver: true }),
-          Animated.sequence([
-            Animated.timing(p.y, { toValue: dy, duration: 360, useNativeDriver: true }),
-            Animated.timing(p.y, { toValue: dy + gravity, duration: 540, useNativeDriver: true }),
-          ]),
-          Animated.timing(p.r, { toValue: rot, duration: 900, useNativeDriver: true }),
-          Animated.sequence([
-            Animated.timing(p.s, { toValue: 1.08, duration: 120, useNativeDriver: true }),
-            Animated.timing(p.s, { toValue: 1, duration: 400, useNativeDriver: true }),
-          ]),
-          Animated.sequence([
-            Animated.timing(p.o, { toValue: 1, duration: 40, useNativeDriver: true }),
-            Animated.timing(p.o, { toValue: 0, duration: 420, delay: 520, useNativeDriver: true }),
-          ]),
-        ])
-      );
-    }
-
-    Animated.parallel(anims).start(() => setVisible(false));
-  }, [tick, particles, COUNT]);
+    return () => {
+      animation.stop();
+    };
+  }, [tick, particles]);
 
   if (!visible) return null;
 
-  const fallback = { x: 0, y: 0 };
-  const useOrigin = origin ?? fallback;
+  const useOrigin = origin ?? { x: 0, y: 0 };
 
   return (
     <View pointerEvents="none" style={StyleSheet.absoluteFill}>
-      <View style={[crackerStyles.origin, { left: useOrigin.x, top: useOrigin.y }]}>
-        {Array.from({ length: COUNT }).map((_, idx) => {
-          const p = particles[idx];
-
-          const rotate = p.r.interpolate({
-            inputRange: [-180, 180],
-            outputRange: ['-180deg', '180deg'],
+      <View
+        style={[
+          crackerStyles.origin,
+          {
+            left: useOrigin.x,
+            top: useOrigin.y,
+          },
+        ]}
+      >
+        {particles.map((particle, index) => {
+          const rotateZ = particle.r.interpolate({
+            inputRange: [-1800, 1800],
+            outputRange: ['-1800deg', '1800deg'],
           });
 
-          const isDot = idx % 4 === 0;
-          const w = isDot ? 6 : 6 + (idx % 3);
-          const h = isDot ? 6 : 12 + (idx % 5);
+          const rotateY = particle.flutter.interpolate({
+            inputRange: [-1, 0, 1],
+            outputRange: ['-40deg', '0deg', '40deg'],
+          });
+
+          const flutterScaleX = particle.flutter.interpolate({
+            inputRange: [-1, 0, 1],
+            outputRange: [0.7, 1, 0.7],
+          });
+
+          // 全て同じ正方形サイズ
+          const width = 10;
+          const height = 10;
+          const borderRadius = 1;
 
           return (
             <Animated.View
-              key={idx}
+              key={index}
               style={[
                 crackerStyles.piece,
                 {
-                  width: w,
-                  height: h,
-                  borderRadius: isDot ? 999 : 2, // ✅ ここで丸粒にする
-                  backgroundColor: colors[idx] ?? tint,
-                  opacity: p.o,
+                  width,
+                  height,
+                  borderRadius,
+                  backgroundColor: colors[index] ?? tint,
+                  opacity: particle.o,
                   transform: [
-                    { translateX: p.x },
-                    { translateY: p.y },
-                    { rotate },
-                    { scale: p.s },
+                    {
+                      translateX: Animated.add(
+                        particle.x,
+                        particle.sway
+                      ),
+                    },
+                    { translateY: particle.y },
+
+                    // 3D回転に必要
+                    { perspective: 500 },
+
+                    // 画面に対する平面回転
+                    { rotateZ },
+
+                    // 紙が表裏にひっくり返る
+                    { rotateY },
+
+                    // 横を向いたときに細く見せる
+                    { scaleX: flutterScaleX },
+
+                    { scale: particle.s },
                   ],
                 },
               ]}
