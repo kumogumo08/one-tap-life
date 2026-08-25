@@ -11,7 +11,11 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { DEFAULT_CHARACTER_ID } from '@/src/data/characters';
 import { getRandomPraiseForCharacter } from '@/src/data/praises';
 import { getDescriptionByLabel } from '@/src/data/tasks';
-import { ensureOwnedCharacterId } from '@/src/lib/characterAccess';
+import {
+  ensureOwnedCharacterId,
+  initializePackAccess,
+} from '@/src/lib/characterAccess';
+import { dateKeyLocal } from '@/src/lib/dateKey';
 import { pickTask } from '@/src/lib/pickTask';
 import {
   defaultPremiumState,
@@ -19,9 +23,11 @@ import {
   loadPremiumState,
   PremiumState,
 } from '@/src/lib/premium';
+import { ensureUserProgress, getAvailableTaskLevels, recordTaskCompletion } from '@/src/lib/progress';
 import { readJson, writeJson } from '@/src/lib/storage';
 import { STORAGE_KEYS } from '@/src/lib/storageKeys';
 import type { CharacterId } from '@/src/types/character';
+import { DEFAULT_USER_PROGRESS } from '@/src/types/progress';
 import type { DailyState, HistoryItem, TaskLevel } from '@/src/types/storage';
 import {
   DEFAULT_DAILY_STATE,
@@ -86,22 +92,16 @@ const RAINBOW = [
   '#FF2D55',
 ];
 
-function pad2(n: number) {
-  return String(n).padStart(2, '0');
-}
-function dateKeyLocal(d: Date) {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
-
 const addHistory = async (
   taskText: string,
   taskId: string | null | undefined,
-  isExtra = false
-) => {
+  isExtra = false,
+  ts: number
+): Promise<boolean> => {
   const item: HistoryItem = {
-    id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    id: `${ts}_${Math.random().toString(16).slice(2)}`,
     task: taskText,
-    ts: Date.now(),
+    ts,
     isExtra,
   };
   if (typeof taskId === 'string' && taskId.length > 0) {
@@ -113,9 +113,9 @@ const addHistory = async (
       await readJson<unknown>(STORAGE_KEYS.history, [])
     );
     const next = [item, ...prev].slice(0, 500);
-    await writeJson(STORAGE_KEYS.history, next);
+    return await writeJson(STORAGE_KEYS.history, next);
   } catch {
-    // 本番では静かに失敗させる
+    return false;
   }
 };
 
@@ -136,6 +136,7 @@ export default function HomeScreen() {
     useState<CharacterId>(DEFAULT_CHARACTER_ID);
   const [extraInProgress, setExtraInProgress] = useState(false);
   const [level, setLevel] = useState<TaskLevel>(1);
+  const [progress, setProgress] = useState(DEFAULT_USER_PROGRESS);
   const [ready, setReady] = useState(false);
   const [praiseTick, setPraiseTick] = useState(0);
   const [openDesc, setOpenDesc] = useState(false);
@@ -172,7 +173,8 @@ export default function HomeScreen() {
   const opRef = useRef(false); // ✅ ユーザーが操作したらtrue
 
   // 公開版ゲート済みレベルで抽選（保存上の level と食い違わないようにする）
-  const activeLevel = normalizeAvailableLevel(level);
+  const availableLevels = getAvailableTaskLevels(progress);
+  const activeLevel = normalizeAvailableLevel(level, availableLevels);
 
   // --- 以下、あなたの既存コード続き ---
   const btnOpacity = useRef(new Animated.Value(1)).current;
@@ -236,14 +238,28 @@ export default function HomeScreen() {
         setReady(false);
   
         try {
-          // --- settings load ---
+          // --- pack access init（完了前に Family Pack を未購入扱いしない）---
+          await initializePackAccess();
+          if (!alive) return;
+
+          // --- progress + settings ---
+          let selectedLevel: TaskLevel = 1;
           try {
+            const currentProgress = await ensureUserProgress();
+            setProgress(currentProgress);
+            const available = getAvailableTaskLevels(currentProgress);
+
             const rawSettings = await readJson<unknown>(STORAGE_KEYS.settings, null);
             const settings = normalizeUserSettings(rawSettings);
             setSelectedCharacterId(ensureOwnedCharacterId(settings.selectedCharacterId));
-            // 抽選・表示は公開版ゲート後のレベルのみ使う
-            setLevel(normalizeAvailableLevel(settings.level));
-          } catch {}
+            selectedLevel = normalizeAvailableLevel(settings.level, available);
+            setLevel(selectedLevel);
+          } catch {
+            setProgress(DEFAULT_USER_PROGRESS);
+            setLevel(1);
+            selectedLevel = 1;
+          }
+          if (!alive) return;
   
           // --- premium load（もう1つやる上限のため）---
           try {
@@ -299,22 +315,19 @@ export default function HomeScreen() {
             return; // ✅ この return は finally を通る形で使う（runの外ではない）
           }
   
-          // ② migration 済み形で保存し直し（フィールド欠落補完）
+          // ② 以降は最終 daily を決めてから保存する
           if (!alive) return;
-  
-          setDaily(saved);
-          await writeJson(STORAGE_KEYS.daily, saved);
-  
-          // ③ completed のときは表示復元
+
+          // ③ completed のときは表示復元（メインタスクは維持。追加抽選は新しい activeLevel）
           if (saved.completed && saved.task) {
+            setDaily(saved);
+            await writeJson(STORAGE_KEYS.daily, saved);
+
             setTask(saved.task);
             setTyped(saved.task);
             setPhase('showTask');
-          
-            // 完了してるなら完了ボタンは出さない
             setCanComplete(false);
             setCurrentIsExtra(false);
-          
             btnOpacity.setValue(0);
             btnScale.setValue(0.95);
             taskOpacity.setValue(1);
@@ -322,22 +335,50 @@ export default function HomeScreen() {
             return;
           }
           
-          // ✅ ③.5 未完了だが task がある（＝今日タスクは確定済み）→ 表示復元（完了ボタンあり）
+          // ✅ ③.5 未完了だが task がある
           if (!saved.completed && saved.task) {
+            // 旧データに taskLevel が無い場合は Lv1 相当として扱う
+            const shownLevel = saved.taskLevel ?? 1;
+            if (shownLevel !== selectedLevel) {
+              const picked = pickTask(selectedLevel, saved.lastTaskId ?? null);
+              const nextDaily: DailyState = {
+                ...saved,
+                task: picked.label,
+                lastTaskId: picked.id,
+                taskLevel: selectedLevel,
+                completed: false,
+              };
+              setDaily(nextDaily);
+              await writeJson(STORAGE_KEYS.daily, nextDaily);
+
+              setTask(picked.label);
+              setTyped(picked.label);
+              setPhase('showTask');
+              setCanComplete(true);
+              setCurrentIsExtra(false);
+              btnOpacity.setValue(0);
+              btnScale.setValue(0.95);
+              taskOpacity.setValue(1);
+              taskY.setValue(0);
+              return;
+            }
+
+            setDaily(saved);
+            await writeJson(STORAGE_KEYS.daily, saved);
             setTask(saved.task);
-            setTyped(saved.task); // タイピング演出をしたいなら '' にしてもOK
+            setTyped(saved.task);
             setPhase('showTask');
-          
-            // 未完了なので完了ボタンを出す
             setCanComplete(true);
             setCurrentIsExtra(false);
-          
             btnOpacity.setValue(0);
             btnScale.setValue(0.95);
             taskOpacity.setValue(1);
             taskY.setValue(0);
             return;
           }
+
+          setDaily(saved);
+          await writeJson(STORAGE_KEYS.daily, saved);
           
           // ④ 未完了かつ task も空の場合だけ、idle に戻す（ただし操作中は触らない）
           const userAlreadyOperating =
@@ -444,6 +485,7 @@ export default function HomeScreen() {
         task: todayTask,
         completed: false,
         lastTaskId: baseDaily.task ? (baseDaily.lastTaskId ?? null) : (picked?.id ?? null),
+        taskLevel: baseDaily.task ? (baseDaily.taskLevel ?? activeLevel) : activeLevel,
       };
     
       setDaily(nextDaily);
@@ -475,8 +517,19 @@ export default function HomeScreen() {
     
       try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
     
-      // 履歴に保存（ここが唯一の addHistory）
-      await addHistory(task, daily?.lastTaskId, currentIsExtra);
+      // 履歴に保存（ここが唯一の addHistory）。成功時のみ進捗を加算する
+      const completedTs = Date.now();
+      const historySaved = await addHistory(
+        task,
+        daily?.lastTaskId,
+        currentIsExtra,
+        completedTs
+      );
+      if (historySaved) {
+        try {
+          await recordTaskCompletion(completedTs);
+        } catch {}
+      }
     
       if (!currentIsExtra) {
         const nextDaily: DailyState = {
@@ -487,6 +540,7 @@ export default function HomeScreen() {
           completedTs: Date.now(),
           extraCount: daily?.extraCount ?? 0,
           lastTaskId: daily?.lastTaskId ?? null,
+          taskLevel: daily?.taskLevel ?? activeLevel,
         };
         setDaily(nextDaily);
         await writeJson(STORAGE_KEYS.daily, nextDaily);

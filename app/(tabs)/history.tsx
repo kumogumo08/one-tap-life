@@ -7,18 +7,11 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { dateKeyLocal, pad2 } from '@/src/lib/dateKey';
 import { readJson, removeKey } from '@/src/lib/storage';
 import { STORAGE_KEYS } from '@/src/lib/storageKeys';
 import type { HistoryItem } from '@/src/types/storage';
 import { normalizeHistoryList } from '@/src/types/storage';
-
-function pad2(n: number) {
-  return String(n).padStart(2, '0');
-}
-
-function dateKeyLocal(d: Date) {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
 
 function formatTimeLocal(ts: number) {
   const d = new Date(ts);

@@ -10,25 +10,50 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 
-import { DEFAULT_CHARACTER_ID, getCharacterById } from '@/src/data/characters';
-import { ensureOwnedCharacterId } from '@/src/lib/characterAccess';
+import {
+  DEFAULT_CHARACTER_ID,
+  getCharacterById,
+  isCharacterId,
+} from '@/src/data/characters';
+import {
+  applyRevenueCatFamilyPackOwnership,
+  ensureOwnedCharacterId,
+  getDevFamilyPackOverride,
+  getPackAccessState,
+  initializePackAccess,
+  setDevFamilyPackOverride,
+  type DevFamilyPackOverride,
+} from '@/src/lib/characterAccess';
+import { restoreFamilyPackPurchases } from '@/src/lib/revenueCat';
 import {
   defaultPremiumState,
   getTrialActive,
   loadPremiumState,
   PremiumState,
 } from '@/src/lib/premium';
+import {
+  ensureUserProgress,
+  getAvailableTaskLevels,
+  getLevelUnlockProgress,
+  isLevelUnlocked,
+} from '@/src/lib/progress';
 import { readJson, removeKey, writeJson } from '@/src/lib/storage';
 import { STORAGE_KEYS } from '@/src/lib/storageKeys';
 import type { CharacterId } from '@/src/types/character';
+import { DEFAULT_USER_PROGRESS, type UserProgress } from '@/src/types/progress';
 import type { TaskLevel } from '@/src/types/storage';
 import {
-  AVAILABLE_TASK_LEVELS,
   normalizeAvailableLevel,
   normalizeUserSettings,
   toSavableUserSettings,
 } from '@/src/types/storage';
 import { router } from 'expo-router';
+
+function formatDevFamilyPackOverride(value: DevFamilyPackOverride): string {
+  if (value === true) return '購入済み（強制）';
+  if (value === false) return '未購入（強制）';
+  return '実購入状態を使用';
+}
 
 export default function SettingsScreen() {
   const colorScheme = useColorScheme();
@@ -36,15 +61,19 @@ export default function SettingsScreen() {
   const [selectedCharacterId, setSelectedCharacterId] =
     useState<CharacterId>(DEFAULT_CHARACTER_ID);
   const [level, setLevel] = useState<TaskLevel>(1);
+  const [progress, setProgress] = useState<UserProgress>(DEFAULT_USER_PROGRESS);
+  const [devFamilyPackOverride, setDevFamilyPackOverrideState] =
+    useState<DevFamilyPackOverride>(null);
   const currentCharacter = getCharacterById(
     ensureOwnedCharacterId(selectedCharacterId)
   );
 
   const saveLevel = async (lv: TaskLevel) => {
-    // 公開版では AVAILABLE のみ保存・表示（将来配列に 2,3 を足せば解放）
-    if (!AVAILABLE_TASK_LEVELS.includes(lv)) return;
+    const currentProgress = await ensureUserProgress();
+    setProgress(currentProgress);
+    if (!isLevelUnlocked(lv, currentProgress)) return;
 
-    setLevel(lv); // UI先
+    setLevel(lv);
     const current = normalizeUserSettings(
       await readJson<unknown>(STORAGE_KEYS.settings, null)
     );
@@ -53,45 +82,6 @@ export default function SettingsScreen() {
       level: lv,
     });
     await writeJson(STORAGE_KEYS.settings, next);
-  };
-
-  const onPressLevel1 = async () => {
-    await saveLevel(1);
-  };
-
-  const onPressLevel2 = async () => {
-    if (!AVAILABLE_TASK_LEVELS.includes(2)) return;
-
-    const p = await loadPremiumState();
-    const trialActive = getTrialActive(p);
-  
-    if (p.isPremium || trialActive) {
-      await saveLevel(2);
-      return;
-    }
-  
-    // 未開始 or 体験終了 → PremiumPageへ
-    router.push({
-      pathname: '/premium',
-      params: { from: 'level2' },
-    });
-  };
-  
-  const onPressLevel3 = async () => {
-    if (!AVAILABLE_TASK_LEVELS.includes(3)) return;
-
-    const p = await loadPremiumState();
-  
-    if (p.isPremium) {
-      await saveLevel(3);
-      return;
-    }
-  
-    // Lv3は体験不可（方針固定）
-    router.push({
-      pathname: '/premium',
-      params: { from: 'level3' },
-    });
   };
   
   // プレミアム状態（表示用にも使える）
@@ -102,20 +92,71 @@ export default function SettingsScreen() {
     setPremiumState(p);
   };
 
+  const syncSelectedCharacterAfterAccessChange = async () => {
+    // 初期化完了後にのみ所有判定で fallback する
+    await initializePackAccess();
+
+    const raw = await readJson<unknown>(STORAGE_KEYS.settings, null);
+    const current = normalizeUserSettings(raw);
+
+    // normalize 済みIDではなく、保存されている生IDを基準にする
+    // （normalize 内 fallback との二重変換で書き込み判定が消えるのを防ぐ）
+    const storedId =
+      raw &&
+      typeof raw === 'object' &&
+      isCharacterId((raw as { selectedCharacterId?: unknown }).selectedCharacterId)
+        ? (raw as { selectedCharacterId: CharacterId }).selectedCharacterId
+        : current.selectedCharacterId;
+
+    const safeId = ensureOwnedCharacterId(storedId);
+    setSelectedCharacterId(safeId);
+
+    if (safeId !== storedId) {
+      await writeJson(
+        STORAGE_KEYS.settings,
+        toSavableUserSettings({
+          selectedCharacterId: safeId,
+          level: current.level,
+        })
+      );
+    }
+  };
+
+  const applyDevFamilyPackOverride = async (value: DevFamilyPackOverride) => {
+    if (!__DEV__) return;
+    await setDevFamilyPackOverride(value);
+    setDevFamilyPackOverrideState(getDevFamilyPackOverride());
+    await syncSelectedCharacterAfterAccessChange();
+  };
+
   const load = async () => {
     try {
+      await initializePackAccess();
+      if (__DEV__) {
+        setDevFamilyPackOverrideState(getDevFamilyPackOverride());
+      }
+    } catch {}
+
+    try {
+      const currentProgress = await ensureUserProgress();
+      setProgress(currentProgress);
       const rawSettings = await readJson<unknown>(STORAGE_KEYS.settings, null);
       const settings = normalizeUserSettings(rawSettings);
       setSelectedCharacterId(ensureOwnedCharacterId(settings.selectedCharacterId));
-      // UI上の選択表示は公開ゲート後のレベルに合わせる
-      setLevel(normalizeAvailableLevel(settings.level));
+      setLevel(
+        normalizeAvailableLevel(
+          settings.level,
+          getAvailableTaskLevels(currentProgress)
+        )
+      );
     } catch {
       setSelectedCharacterId(DEFAULT_CHARACTER_ID);
       setLevel(1);
     }
   
-    // ✅ finallyじゃなく、try/catchの外で await
-    await loadPremium();
+    if (__DEV__) {
+      await loadPremium();
+    }
   };
 
   useFocusEffect(
@@ -131,41 +172,50 @@ export default function SettingsScreen() {
     router.push('/characters');
   };
 
-  const levelRow = (lv: TaskLevel, subtitle: string) => {
+  const levelRow = (lv: TaskLevel) => {
     const isActive = level === lv;
-  
-    // ✅ 公開版で未解放のレベルは準備中
-    const comingSoon = !AVAILABLE_TASK_LEVELS.includes(lv);
-  
-    const onPress =
-      lv === 1 ? onPressLevel1 :
-      lv === 2 ? onPressLevel2 :
-      onPressLevel3;
-  
+    const unlocked = isLevelUnlocked(lv, progress);
+    const locked = !unlocked;
+    const unlock =
+      lv === 1 ? null : getLevelUnlockProgress(lv, progress);
+
+    const title =
+      lv === 1 ? 'Lv1（軽め）' : lv === 2 ? 'Lv2（標準）' : 'Lv3（本格）';
+
+    const subtitle = unlocked
+      ? lv === 1
+        ? '今日1つ＋追加3回まで'
+        : lv === 2
+          ? '続けて体を動かしたい日に'
+          : '習慣化を本気で続けたい人向け'
+      : unlock
+        ? `${unlock.requiredDays}日経過 ＋ ${unlock.requiredCompletions}回達成で解放`
+        : '';
+
     return (
       <Pressable
         key={lv}
-        disabled={comingSoon}
-        onPress={comingSoon ? undefined : onPress}
+        disabled={locked}
+        onPress={locked ? undefined : () => void saveLevel(lv)}
         android_disableSound
         accessibilityRole="button"
-        accessibilityState={{ disabled: comingSoon }}
+        accessibilityState={{ disabled: locked }}
         style={[styles.levelCard, { borderColor: theme.tint }, isActive && styles.levelCardActive]}
       >
         <View style={styles.levelTopRow}>
           <ThemedText style={styles.levelIcon}>
-            {isActive ? '●' : comingSoon ? '🔒' : '○'}
+            {isActive ? '●' : locked ? '🔒' : '○'}
           </ThemedText>
-  
-          <ThemedText style={styles.levelTitle}>
-            {lv === 1 ? 'Lv1（標準）' : lv === 2 ? 'Lv2' : 'Lv3'}
-          </ThemedText>
+
+          <ThemedText style={styles.levelTitle}>{title}</ThemedText>
         </View>
-  
-        {/* ✅ subtitle は表示上そのまま受け取るが、comingSoonなら「準備中」に固定 */}
-        <ThemedText style={styles.levelSub}>
-          {comingSoon ? '準備中' : subtitle}
-        </ThemedText>
+
+        <ThemedText style={styles.levelSub}>{subtitle}</ThemedText>
+        {locked && unlock ? (
+          <ThemedText style={styles.levelSub}>
+            {unlock.elapsedDays} / {unlock.requiredDays}日 ・ {unlock.completedCount} / {unlock.requiredCompletions}回
+          </ThemedText>
+        ) : null}
       </Pressable>
     );
   };
@@ -211,7 +261,7 @@ export default function SettingsScreen() {
         onPress: async () => {
           try {
             await removeKey(STORAGE_KEYS.premium);
-            await load(); // load() は最後に loadPremium() も呼ぶので表示も更新される
+            await load(); // __DEV__ では loadPremium() も呼ぶので表示も更新される
           } catch {
             // 本番ログ不要
           }
@@ -223,14 +273,22 @@ export default function SettingsScreen() {
   const resetAllDebug = async () => {
     if (!__DEV__) return;
   
-    Alert.alert('確認', '今日＋プレミアムをリセットしますか？', [
+    Alert.alert(
+      '確認',
+      '今日・プレミアム・ファミリーパックDEV設定をリセットしますか？',
+      [
       { text: 'キャンセル', style: 'cancel' },
       {
         text: 'リセット',
         style: 'destructive',
         onPress: async () => {
           try {
-            await AsyncStorage.multiRemove([STORAGE_KEYS.daily, STORAGE_KEYS.premium]);
+            await AsyncStorage.multiRemove([
+              STORAGE_KEYS.daily,
+              STORAGE_KEYS.premium,
+              STORAGE_KEYS.devFamilyPackOverride,
+            ]);
+            await setDevFamilyPackOverride(null);
             await load();
             router.replace('/(tabs)');
           } catch {
@@ -257,6 +315,24 @@ export default function SettingsScreen() {
     }
   };
 
+  const restorePurchases = async () => {
+    const result = await restoreFamilyPackPurchases();
+
+    if (result.status === 'unavailable' || result.status === 'error') {
+      Alert.alert('復元できませんでした', result.message);
+      return;
+    }
+
+    applyRevenueCatFamilyPackOwnership(result.hasFamilyPack);
+    await syncSelectedCharacterAfterAccessChange();
+
+    if (result.hasFamilyPack) {
+      Alert.alert('復元完了', 'ファミリーパックの購入を復元しました。');
+    } else {
+      Alert.alert('復元結果', '復元できる購入が見つかりませんでした。');
+    }
+  };
+
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.background }]}>
       <ThemedView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -270,25 +346,10 @@ export default function SettingsScreen() {
         <View style={styles.section}>
           <ThemedText style={styles.sectionTitle}>レベル</ThemedText>
 
-          {levelRow(1, '今日1つ＋追加3回まで')}
-          {levelRow(2, '回数制限なし・もっとやりたい日に')}
-          {levelRow(3, '習慣化を本気で続けたい人向け')}
+          {levelRow(1)}
+          {levelRow(2)}
+          {levelRow(3)}
         </View>
-
-        <Pressable
-          disabled
-          onPress={undefined}
-          android_disableSound
-          accessibilityRole="button"
-          accessibilityState={{ disabled: true }}
-          style={[styles.levelCard, { borderColor: theme.tint }]}
-        >
-          <View style={styles.levelTopRow}>
-            <ThemedText style={styles.levelIcon}>★</ThemedText>
-            <ThemedText style={styles.levelTitle}>プレミアム</ThemedText>
-          </View>
-          <ThemedText style={styles.levelSub}>準備中</ThemedText>
-        </Pressable>
 
         {/* ===== 褒めてくれるキャラクター ===== */}
         <View style={styles.section}>
@@ -331,6 +392,14 @@ export default function SettingsScreen() {
             </ThemedText>
           </Pressable>
 
+          <Pressable
+            onPress={() => void restorePurchases()}
+            style={styles.choiceBtn}
+            accessibilityRole="button"
+          >
+            <ThemedText style={styles.choiceText}>購入を復元</ThemedText>
+          </Pressable>
+
           <ThemedText style={styles.note}>
             Version 1.0.0
           </ThemedText>
@@ -341,19 +410,52 @@ export default function SettingsScreen() {
         <View style={styles.section}>
           <ThemedText style={styles.sectionTitle}>デバッグ</ThemedText>
 
-          <Pressable onPress={resetToday}>
+          <ThemedText style={styles.debugStatus}>
+            ファミリーパック override: {formatDevFamilyPackOverride(devFamilyPackOverride)}
+          </ThemedText>
+          <ThemedText style={styles.debugStatus}>
+            判定結果:{' '}
+            {(() => {
+              const state = getPackAccessState();
+              if (!state.initialized) return '初期化中';
+              return state.hasFamilyPack ? '購入済み' : '未購入';
+            })()}
+          </ThemedText>
+
+          <Pressable
+            onPress={() => void applyDevFamilyPackOverride(true)}
+            style={styles.debugBtn}
+          >
+            <ThemedText>ファミリーパック：購入済みにする</ThemedText>
+          </Pressable>
+
+          <Pressable
+            onPress={() => void applyDevFamilyPackOverride(false)}
+            style={styles.debugBtn}
+          >
+            <ThemedText>ファミリーパック：未購入にする</ThemedText>
+          </Pressable>
+
+          <Pressable
+            onPress={() => void applyDevFamilyPackOverride(null)}
+            style={styles.debugBtn}
+          >
+            <ThemedText>ファミリーパック：実購入状態を使用</ThemedText>
+          </Pressable>
+
+          <Pressable onPress={resetToday} style={styles.debugBtn}>
             <ThemedText>（デバッグ）今日をリセット</ThemedText>
           </Pressable>
 
-          <Pressable onPress={resetPremium}>
+          <Pressable onPress={resetPremium} style={styles.debugBtn}>
             <ThemedText>（デバッグ）プレミアム状態をリセット</ThemedText>
           </Pressable>
 
-          <Pressable onPress={resetAllDebug}>
-            <ThemedText>（デバッグ）全部リセット（今日＋プレミアム）</ThemedText>
+          <Pressable onPress={resetAllDebug} style={styles.debugBtn}>
+            <ThemedText>（デバッグ）全部リセット（今日＋プレミアム＋FP）</ThemedText>
           </Pressable>
 
-          <ThemedText>
+          <ThemedText style={styles.debugStatus}>
             premium: {premiumState.isPremium ? 'true' : 'false'} / trial:{' '}
             {getTrialActive(premiumState) ? 'active' : 'off'}
           </ThemedText>
@@ -452,6 +554,16 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   levelSub: {
+    marginTop: 6,
+    opacity: 0.7,
+    fontSize: 12,
+  },
+
+  debugBtn: {
+    marginTop: 10,
+    paddingVertical: 10,
+  },
+  debugStatus: {
     marginTop: 6,
     opacity: 0.7,
     fontSize: 12,

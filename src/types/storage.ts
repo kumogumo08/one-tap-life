@@ -22,6 +22,8 @@ export type DailyState = {
   completedTs?: number;
   extraCount?: number;
   lastTaskId?: string | null;
+  /** 今日のメインタスクのレベル。旧データには無い */
+  taskLevel?: TaskLevel;
 };
 
 export type HistoryItem = {
@@ -33,8 +35,11 @@ export type HistoryItem = {
   taskId?: string;
 };
 
-/** 公開版でタスク抽選に使えるレベル。将来ここに 2, 3 を足す */
-export const AVAILABLE_TASK_LEVELS: TaskLevel[] = [1];
+export type { UserProgress } from '@/src/types/progress';
+export { DEFAULT_USER_PROGRESS, normalizeUserProgress } from '@/src/types/progress';
+
+/** 全タスクレベル。実際の利用可否は getAvailableTaskLevels(progress) */
+export const ALL_TASK_LEVELS: TaskLevel[] = [1, 2, 3];
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
   selectedCharacterId: DEFAULT_CHARACTER_ID,
@@ -69,9 +74,12 @@ export function normalizeTaskLevel(value: unknown): TaskLevel {
   return value === 1 || value === 2 || value === 3 ? value : 1;
 }
 
-export function normalizeAvailableLevel(level: unknown): TaskLevel {
+export function normalizeAvailableLevel(
+  level: unknown,
+  availableLevels: readonly TaskLevel[]
+): TaskLevel {
   const lv = normalizeTaskLevel(level);
-  return AVAILABLE_TASK_LEVELS.includes(lv) ? lv : 1;
+  return availableLevels.includes(lv) ? lv : 1;
 }
 
 export function normalizeUserSettings(value: unknown): UserSettings {
@@ -97,7 +105,7 @@ export function normalizeUserSettings(value: unknown): UserSettings {
   return {
     selectedCharacterId,
     praiseStyle,
-    // 保存上の level は 1|2|3 を許容（将来解放時に好みを残す）。抽選は normalizeAvailableLevel を使う
+    // 保存上の level は 1|2|3 を許容。抽選・表示は getAvailableTaskLevels 後に normalizeAvailableLevel
     level: normalizeTaskLevel(raw.level),
   };
 }
@@ -135,6 +143,10 @@ export function normalizeDailyState(value: unknown, todayKey: string): DailyStat
       : raw.lastTaskId === null
         ? null
         : null;
+  const taskLevel =
+    raw.taskLevel === 1 || raw.taskLevel === 2 || raw.taskLevel === 3
+      ? raw.taskLevel
+      : undefined;
 
   return {
     dateKey,
@@ -143,6 +155,7 @@ export function normalizeDailyState(value: unknown, todayKey: string): DailyStat
     completedTs,
     extraCount,
     lastTaskId,
+    taskLevel,
   };
 }
 
@@ -150,7 +163,12 @@ export function normalizeHistoryItem(value: unknown): HistoryItem | null {
   if (!value || typeof value !== 'object') return null;
 
   const raw = value as Record<string, unknown>;
-  if (typeof raw.id !== 'string' || typeof raw.task !== 'string' || typeof raw.ts !== 'number') {
+  if (
+    typeof raw.id !== 'string' ||
+    typeof raw.task !== 'string' ||
+    typeof raw.ts !== 'number' ||
+    !Number.isFinite(raw.ts)
+  ) {
     return null;
   }
 

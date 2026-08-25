@@ -1,6 +1,6 @@
 import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -8,12 +8,14 @@ import { ThemedText } from '@/components/themed-text';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
+import { usePackAccessVersion } from '@/hooks/use-pack-access';
 import { DEFAULT_CHARACTER_ID } from '@/src/data/characters';
 import {
   ensureOwnedCharacterId,
   getAvailableCharacters,
   getPackCharacterNames,
   getShopPacks,
+  initializePackAccess,
   isCharacterOwned,
   isPackOwned,
 } from '@/src/lib/characterAccess';
@@ -28,6 +30,8 @@ import {
 export default function CharacterSelectScreen() {
   const colorScheme = useColorScheme();
   const theme = Colors[colorScheme ?? 'light'];
+  // DEV override 変更時に再描画する
+  const packAccessVersion = usePackAccessVersion();
   const [selectedCharacterId, setSelectedCharacterId] =
     useState<CharacterId>(DEFAULT_CHARACTER_ID);
 
@@ -37,6 +41,7 @@ export default function CharacterSelectScreen() {
   const shopPacks = getShopPacks();
 
   const load = useCallback(async () => {
+    await initializePackAccess();
     const settings = normalizeUserSettings(
       await readJson<unknown>(STORAGE_KEYS.settings, null)
     );
@@ -48,6 +53,10 @@ export default function CharacterSelectScreen() {
       void load();
     }, [load])
   );
+
+  useEffect(() => {
+    void load();
+  }, [load, packAccessVersion]);
 
   const selectCharacter = async (characterId: CharacterId) => {
     if (!isCharacterOwned(characterId)) return;
