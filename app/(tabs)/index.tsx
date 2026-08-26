@@ -1,7 +1,7 @@
 import { useFocusEffect } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, Easing, ImageBackground, Pressable, StyleSheet, View } from 'react-native';
+import { Animated, Easing, ImageBackground, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
@@ -122,7 +122,16 @@ const addHistory = async (
 export default function HomeScreen() {
   // Hooksは必ず先頭で固定順に
   const colorScheme = useColorScheme();
-  const theme = Colors[colorScheme ?? 'light'];
+  const isDark = colorScheme === 'dark';
+  const homeTint = Colors.light.tint;
+  // 説明Modalのみダーク対応。ホーム本体の色味はライト固定
+  const modalBackground = isDark ? '#1C1C1E' : '#F7FAFC';
+  const modalText = isDark ? Colors.dark.text : '#5C7EA6';
+  const modalOverlay = isDark ? 'rgba(0, 0, 0, 0.55)' : 'rgba(0, 0, 0, 0.35)';
+  const modalCardBorder = isDark ? 'rgba(255,255,255,0.12)' : 'transparent';
+  const modalCloseBg = isDark ? '#2C3136' : Colors.light.tint;
+  const modalCloseBorder = isDark ? '#687076' : 'transparent';
+  const modalCloseText = isDark ? Colors.dark.text : '#fff';
 
   // ✅ まず state（pickTask が daily を参照するため）
   const [daily, setDaily] = useState<DailyState | null>(null);
@@ -139,38 +148,13 @@ export default function HomeScreen() {
   const [progress, setProgress] = useState(DEFAULT_USER_PROGRESS);
   const [ready, setReady] = useState(false);
   const [praiseTick, setPraiseTick] = useState(0);
-  const [openDesc, setOpenDesc] = useState(false);
-
-  const descY = useRef(new Animated.Value(8)).current;
-  const descOpacity = useRef(new Animated.Value(0)).current;
+  const [descModalVisible, setDescModalVisible] = useState(false);
 
   const [premiumState, setPremiumState] = useState<PremiumState>(defaultPremiumState);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    Animated.parallel([
-      Animated.timing(descOpacity, {
-        toValue: openDesc ? 1 : 0,
-        duration: 180,
-        useNativeDriver: true,
-      }),
-      Animated.timing(descY, {
-        toValue: openDesc ? 0 : 8,
-        duration: 180,
-        useNativeDriver: true,
-      }),
-    ]).start();
-  }, [openDesc]);
-
-  useEffect(() => {
-    setOpenDesc(false);
-  }, [task]);
-
-  const toggleDesc = useCallback(() => {
-    setOpenDesc(prev => !prev);
-  }, []);
-
   const opRef = useRef(false); // ✅ ユーザーが操作したらtrue
+  const homeRestoreGenRef = useRef(0);
+  const restoreIncompleteMainTaskRef = useRef<(label: string, nextDaily?: DailyState) => void>(() => {});
 
   // 公開版ゲート済みレベルで抽選（保存上の level と食い違わないようにする）
   const availableLevels = getAvailableTaskLevels(progress);
@@ -221,6 +205,14 @@ export default function HomeScreen() {
     !extraInProgress &&
     extraCount < extraLimit;
 
+  // 完了ボタンは canComplete フラグだけに頼らない（focus 復元の競合で false になり得る）
+  const canSubmitComplete =
+    phase !== 'idle' &&
+    !!task &&
+    (currentIsExtra
+      ? extraInProgress && canComplete
+      : daily != null && daily.completed !== true);
+
   const triggerCracker = () => setCrackerTick(t => t + 1);
 
   const [fontsLoaded] = useFonts({
@@ -228,63 +220,95 @@ export default function HomeScreen() {
     ZenMaruGothic_700Bold,
   });
 
-  // 今日状態を復元（アプリ起動/画面初回）
+  /** 未完了メインタスクを「ワンタップ直後」と同じ操作可能状態にする */
+  const restoreIncompleteMainTask = (label: string, nextDaily?: DailyState) => {
+    if (nextDaily) {
+      setDaily(nextDaily);
+    }
+    setTask(label);
+    setTyped(label);
+    setPhase('showTask');
+    phaseRef.current = 'showTask';
+    taskRef.current = label;
+    setCanComplete(true);
+    setCurrentIsExtra(false);
+    setDescModalVisible(false);
+    setPraise('');
+    setTypedPraise('');
+    setExtraInProgress(false);
+    opRef.current = true;
+    btnOpacity.setValue(0);
+    btnScale.setValue(0.95);
+    taskOpacity.setValue(1);
+    taskY.setValue(0);
+  };
+  restoreIncompleteMainTaskRef.current = restoreIncompleteMainTask;
+
+  // 今日状態を復元（アプリ起動/画面初回/タブ復帰）
   useFocusEffect(
     useCallback(() => {
+      const gen = ++homeRestoreGenRef.current;
       let alive = true;
-  
+      const isCurrent = () => alive && homeRestoreGenRef.current === gen;
+
       const run = async () => {
-        if (!alive) return;
+        if (!isCurrent()) return;
         setReady(false);
-  
+
         try {
           // --- pack access init（完了前に Family Pack を未購入扱いしない）---
           await initializePackAccess();
-          if (!alive) return;
+          if (!isCurrent()) return;
 
           // --- progress + settings ---
           let selectedLevel: TaskLevel = 1;
           try {
             const currentProgress = await ensureUserProgress();
+            if (!isCurrent()) return;
             setProgress(currentProgress);
             const available = getAvailableTaskLevels(currentProgress);
 
             const rawSettings = await readJson<unknown>(STORAGE_KEYS.settings, null);
+            if (!isCurrent()) return;
             const settings = normalizeUserSettings(rawSettings);
             setSelectedCharacterId(ensureOwnedCharacterId(settings.selectedCharacterId));
             selectedLevel = normalizeAvailableLevel(settings.level, available);
             setLevel(selectedLevel);
           } catch {
+            if (!isCurrent()) return;
             setProgress(DEFAULT_USER_PROGRESS);
             setLevel(1);
             selectedLevel = 1;
           }
-          if (!alive) return;
-  
+          if (!isCurrent()) return;
+
           // --- premium load（もう1つやる上限のため）---
           try {
             const p = await loadPremiumState();
-            if (!alive) return;
+            if (!isCurrent()) return;
             setPremiumState(p);
           } catch {
+            if (!isCurrent()) return;
             setPremiumState(defaultPremiumState);
           }
-  
+
           // --- daily load ---
           const todayKey = dateKeyLocal(new Date());
           const rawDaily = await readJson<unknown>(STORAGE_KEYS.daily, null);
+          if (!isCurrent()) return;
 
           if (rawDaily == null) {
             const fresh = DEFAULT_DAILY_STATE(todayKey);
             await writeJson(STORAGE_KEYS.daily, fresh);
-            if (!alive) return;
+            if (!isCurrent()) return;
             setDaily(fresh);
             setPhase('idle');
             phaseRef.current = 'idle';
             setTask('');
             setTyped('');
             setTypedPraise('');
-            setOpenDesc(false);
+            setCanComplete(false);
+            setDescModalVisible(false);
             btnOpacity.setValue(1);
             btnScale.setValue(1);
             taskOpacity.setValue(0);
@@ -293,51 +317,50 @@ export default function HomeScreen() {
           }
 
           const saved = normalizeDailyState(rawDaily, todayKey);
-  
+
           // ① 日付違い → fresh作成（UIも初期化）
           if (saved.dateKey !== todayKey) {
             const fresh = DEFAULT_DAILY_STATE(todayKey);
-  
             await writeJson(STORAGE_KEYS.daily, fresh);
-            if (!alive) return;
-  
+            if (!isCurrent()) return;
             setDaily(fresh);
-  
-            // UI初期化（ここは “安全に上書きして良い”）
             setPhase('idle');
+            phaseRef.current = 'idle';
             setTask('');
             setTyped('');
+            setCanComplete(false);
             btnOpacity.setValue(1);
             btnScale.setValue(1);
             taskOpacity.setValue(0);
             taskY.setValue(8);
-  
-            return; // ✅ この return は finally を通る形で使う（runの外ではない）
+            return;
           }
-  
-          // ② 以降は最終 daily を決めてから保存する
-          if (!alive) return;
+
+          if (!isCurrent()) return;
 
           // ③ completed のときは表示復元（メインタスクは維持。追加抽選は新しい activeLevel）
           if (saved.completed && saved.task) {
-            setDaily(saved);
             await writeJson(STORAGE_KEYS.daily, saved);
-
+            if (!isCurrent()) return;
+            setDaily(saved);
             setTask(saved.task);
             setTyped(saved.task);
             setPhase('showTask');
+            phaseRef.current = 'showTask';
+            taskRef.current = saved.task;
             setCanComplete(false);
             setCurrentIsExtra(false);
+            setDescModalVisible(false);
+            setExtraInProgress(false);
             btnOpacity.setValue(0);
             btnScale.setValue(0.95);
             taskOpacity.setValue(1);
             taskY.setValue(0);
             return;
           }
-          
-          // ✅ ③.5 未完了だが task がある
+
+          // ③.5 未完了だが task がある
           if (!saved.completed && saved.task) {
-            // 旧データに taskLevel が無い場合は Lv1 相当として扱う
             const shownLevel = saved.taskLevel ?? 1;
             if (shownLevel !== selectedLevel) {
               const picked = pickTask(selectedLevel, saved.lastTaskId ?? null);
@@ -348,49 +371,35 @@ export default function HomeScreen() {
                 taskLevel: selectedLevel,
                 completed: false,
               };
-              setDaily(nextDaily);
               await writeJson(STORAGE_KEYS.daily, nextDaily);
-
-              setTask(picked.label);
-              setTyped(picked.label);
-              setPhase('showTask');
-              setCanComplete(true);
-              setCurrentIsExtra(false);
-              btnOpacity.setValue(0);
-              btnScale.setValue(0.95);
-              taskOpacity.setValue(1);
-              taskY.setValue(0);
+              if (!isCurrent()) return;
+              restoreIncompleteMainTaskRef.current(picked.label, nextDaily);
               return;
             }
 
-            setDaily(saved);
             await writeJson(STORAGE_KEYS.daily, saved);
-            setTask(saved.task);
-            setTyped(saved.task);
-            setPhase('showTask');
-            setCanComplete(true);
-            setCurrentIsExtra(false);
-            btnOpacity.setValue(0);
-            btnScale.setValue(0.95);
-            taskOpacity.setValue(1);
-            taskY.setValue(0);
+            if (!isCurrent()) return;
+            restoreIncompleteMainTaskRef.current(saved.task, saved);
             return;
           }
 
-          setDaily(saved);
           await writeJson(STORAGE_KEYS.daily, saved);
-          
+          if (!isCurrent()) return;
+          setDaily(saved);
+
           // ④ 未完了かつ task も空の場合だけ、idle に戻す（ただし操作中は触らない）
           const userAlreadyOperating =
             opRef.current ||
             phaseRef.current !== 'idle' ||
             !!taskRef.current;
-          
+
           if (userAlreadyOperating) return;
-          
+
           setPhase('idle');
+          phaseRef.current = 'idle';
           setTask('');
           setTyped('');
+          setCanComplete(false);
           btnOpacity.setValue(1);
           btnScale.setValue(1);
           taskOpacity.setValue(0);
@@ -398,12 +407,12 @@ export default function HomeScreen() {
         } catch {
           // 本番ではログ出さない
         } finally {
-          if (alive) setReady(true);
+          if (isCurrent()) setReady(true);
         }
       };
-  
+
       run();
-  
+
       return () => {
         alive = false;
       };
@@ -435,6 +444,7 @@ export default function HomeScreen() {
       setPhase('animating');
       setCanComplete(true);
       setCurrentIsExtra(true);
+      setDescModalVisible(false);
       setPraise('');
       setTypedPraise('');
     
@@ -463,6 +473,7 @@ export default function HomeScreen() {
       setTyped('');          // ←最優先で消す
       setTypedPraise('');
       setPraise('');
+      setDescModalVisible(false);
 
       taskOpacity.setValue(0);
       taskY.setValue(8);
@@ -510,10 +521,23 @@ export default function HomeScreen() {
       taskRef.current = task;
     }, [task]);
 
+    useEffect(() => {
+      setDescModalVisible(false);
+    }, [task]);
+
+    const closeDescModal = useCallback(() => {
+      setDescModalVisible(false);
+    }, []);
+
+    const openDescModal = useCallback(() => {
+      setDescModalVisible(true);
+    }, []);
+
     const onComplete = async () => {
-      if (!task || !canComplete) return;
+      if (!task || !canSubmitComplete) return;
     
       opRef.current = true;
+      setDescModalVisible(false);
     
       try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
     
@@ -645,7 +669,7 @@ if (!fontsLoaded) {
         <CrackerBurst
           tick={crackerTick}
           origin={crackerOrigin}
-          tint={theme.tint}
+          tint={homeTint}
           palette={RAINBOW}
           count={50}
         />
@@ -662,7 +686,7 @@ if (!fontsLoaded) {
                 今日は1つだけでいい
               </ThemedText>
 
-              {/* ✅ ワンタップは「idle の時だけ」描画（完了状態でも表示はする） */}
+              {/* ✅ ワンタップは「idle の時だけ」描画 */}
               {phase === 'idle' && (
                 <Animated.View
                   style={[
@@ -675,18 +699,18 @@ if (!fontsLoaded) {
                     onPress={onTap}
                     style={[
                       styles.circleButton,
-                      { borderColor: theme.tint },
+                      { borderColor: homeTint },
                       !ready && { opacity: 0.4 },
                     ]}
                   >
-                    <IconSymbol size={38} name="hand.tap.fill" color={theme.tint} />
+                    <IconSymbol size={38} name="hand.tap.fill" color={homeTint} />
                     <ThemedText type="defaultSemiBold" style={[styles.circleText, styles.textOutline]}>
                       ワンタップ
                     </ThemedText>
                   </Pressable>
                 </Animated.View>
               )}
-                {/* ✅ タスク表示 */}
+                {/* ✅ タスク表示（説明はModal。画面内展開はしない） */}
                 {phase !== 'idle' ? (
                   <Animated.View
                     style={[
@@ -694,25 +718,38 @@ if (!fontsLoaded) {
                       { opacity: taskOpacity, transform: [{ translateY: taskY }] },
                     ]}
                   >
-                    {/* ★ ここで上に寄せる（-30〜-70で調整） */}
-                    <View style={[styles.taskStack, { transform: [{ translateY: -40 }] }]}>
+                    {/* 元の中央寄せから、キャッチとの間だけ 20〜40px 上へ */}
+                    <View style={[styles.taskStack, { transform: [{ translateY: -64 }] }]}>
                       <View style={styles.taskLabelArea}>
-                        <View style={styles.taskLabelWrap}>
-                          <ThemedText
-                            style={[
-                              styles.taskLabel,
-                              styles.baseText,
-                              styles.textOutline,
-                              styles.taskLabelText,
-                            ]}
-                          >
-                            今日のタスク
-                          </ThemedText>
+                        <View style={styles.taskRow}>
+                          <View style={styles.taskLabelWrap}>
+                            <ThemedText
+                              style={[
+                                styles.taskLabel,
+                                styles.baseText,
+                                styles.textOutline,
+                                styles.taskLabelText,
+                              ]}
+                            >
+                              今日のタスク
+                            </ThemedText>
 
-                          <View style={styles.doubleUnderlineAbsolute}>
-                            <View style={styles.underlinePrimary} />
-                            <View style={styles.underlineSecondary} />
+                            <View style={styles.doubleUnderlineAbsolute}>
+                              <View style={styles.underlinePrimary} />
+                              <View style={styles.underlineSecondary} />
+                            </View>
                           </View>
+
+                          {!!currentDesc && (
+                            <Pressable
+                              onPress={openDescModal}
+                              style={styles.infoBtn}
+                              accessibilityRole="button"
+                              accessibilityLabel="タスクの説明を表示"
+                            >
+                              <ThemedText style={[styles.infoText, styles.textOutline]}>ⓘ</ThemedText>
+                            </Pressable>
+                          )}
                         </View>
                       </View>
 
@@ -720,37 +757,16 @@ if (!fontsLoaded) {
                         {typed}
                       </ThemedText>
 
-                      {/* ⓘ（説明があるタスクだけ表示） */}
-                      {!!currentDesc && (
-                        <Pressable onPress={toggleDesc} style={styles.infoBtn}>
-                          <ThemedText style={[styles.infoText, styles.textOutline]}>ⓘ</ThemedText>
-                        </Pressable>
-                      )}
-
-                      {/* 下からスライド（実際は translateY + opacity） */}
-                      {!!currentDesc && openDesc && (
-                        <Animated.View
-                          style={[
-                            styles.descBox,
-                            { opacity: descOpacity, transform: [{ translateY: descY }] },
-                          ]}
-                        >
-                          <ThemedText style={[styles.descText, styles.textOutline]}>
-                            {currentDesc}
-                          </ThemedText>
-                        </Animated.View>
-                      )}
-
-                      {canComplete && (
+                      {canSubmitComplete && (
                         <Pressable
                           ref={completeBtnRef as any}
                           onPress={onComplete}
                           style={[
                             styles.completeBtn,
-                            { borderColor: theme.tint, backgroundColor: theme.tint },
+                            { borderColor: homeTint, backgroundColor: homeTint },
                           ]}
                         >
-                          <ThemedText style={[styles.completeText, styles.semiBold, styles.textOutline]}>
+                          <ThemedText style={[styles.completeText, styles.semiBold]}>
                             完了！
                           </ThemedText>
                         </Pressable>
@@ -770,7 +786,7 @@ if (!fontsLoaded) {
                 </Pressable>
               )}
 
-              {/* ✅ 画面下にキャラ＋吹き出し（タスク中だけ） */}
+              {/* ✅ 画面下にキャラ＋吹き出し（背景上に重ねる） */}
               {!!typedPraise && phase !== 'idle' && (
                 <View style={styles.praiseOverlay} pointerEvents="none">
                   <PraiseCharacter characterId={selectedCharacterId} message={typedPraise} />
@@ -780,6 +796,62 @@ if (!fontsLoaded) {
           </View>
         </View>
       </SafeAreaView>
+
+      <Modal
+        visible={descModalVisible && !!currentDesc}
+        transparent
+        animationType="fade"
+        onRequestClose={closeDescModal}
+      >
+        <View style={styles.descModalRoot}>
+          <Pressable
+            style={[styles.descModalBackdrop, { backgroundColor: modalOverlay }]}
+            onPress={closeDescModal}
+            accessibilityRole="button"
+            accessibilityLabel="説明を閉じる"
+          />
+          <Pressable
+            style={[
+              styles.descModalCard,
+              {
+                backgroundColor: modalBackground,
+                borderColor: modalCardBorder,
+              },
+            ]}
+            onPress={() => {}}
+          >
+            <ThemedText style={[styles.descModalHeading, styles.semiBold, { color: modalText }]}>
+              タスクの説明
+            </ThemedText>
+            <ThemedText style={[styles.descModalTaskLabel, styles.semiBold, { color: modalText }]}>
+              {task}
+            </ThemedText>
+            <ScrollView
+              style={styles.descModalScroll}
+              contentContainerStyle={styles.descModalScrollContent}
+              showsVerticalScrollIndicator={false}
+              bounces={false}
+            >
+              <ThemedText style={[styles.descText, { color: modalText }]}>
+                {currentDesc}
+              </ThemedText>
+            </ScrollView>
+            <Pressable
+              onPress={closeDescModal}
+              style={[
+                styles.descModalCloseBtn,
+                { backgroundColor: modalCloseBg, borderColor: modalCloseBorder },
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel="閉じる"
+            >
+              <ThemedText style={[styles.descModalCloseText, styles.semiBold, { color: modalCloseText }]}>
+                閉じる
+              </ThemedText>
+            </Pressable>
+          </Pressable>
+        </View>
+      </Modal>
     </ScreenWrapper>
   );
 }
@@ -1166,7 +1238,6 @@ const styles = StyleSheet.create({
   },
 
   catchText: {
-    color: '#374151',
     position: 'absolute',
     top: '18%',
     left: 0,
@@ -1175,7 +1246,7 @@ const styles = StyleSheet.create({
     fontSize: 22,
     fontWeight: '600',
     opacity: 0.75,
-    zIndex: 10,            // ✅ 追加
+    zIndex: 10,
   },
 
   stage: {
@@ -1195,8 +1266,8 @@ const styles = StyleSheet.create({
     right: 0,
     alignItems: 'center',
     justifyContent: 'center',
-    zIndex: 50,            // ✅ 追加
-    elevation: 50,         // ✅ Android対策
+    zIndex: 50,
+    elevation: 50,
   },
 
   circleButton: {
@@ -1244,7 +1315,11 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
   },
 
-  completeText: { color: '#fff',fontSize: 16, fontWeight: '800' },
+  completeText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '800',
+  },
 
   praiseText: {
     marginTop: 50,
@@ -1332,9 +1407,8 @@ const styles = StyleSheet.create({
   },
 
   infoBtn: {
-    marginTop: 8,
-    alignSelf: 'center',
-    paddingHorizontal: 10,
+    marginLeft: 4,
+    paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 999,
   },
@@ -1343,14 +1417,66 @@ const styles = StyleSheet.create({
     fontSize: 16,
     opacity: 0.85,
   },
-  
-  descBox: {
-    marginTop: 10,
-    alignSelf: 'stretch',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderRadius: 14,
-    backgroundColor: 'rgba(255,255,255,0.10)',
+
+  descModalRoot: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 28,
+  },
+
+  descModalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+  },
+
+  descModalCard: {
+    width: '100%',
+    maxWidth: 340,
+    maxHeight: '70%',
+    borderRadius: 20,
+    borderWidth: 1,
+    paddingHorizontal: 20,
+    paddingTop: 22,
+    paddingBottom: 18,
+    alignItems: 'center',
+    zIndex: 1,
+    elevation: 4,
+  },
+
+  descModalHeading: {
+    fontSize: 18,
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+
+  descModalTaskLabel: {
+    fontSize: 16,
+    textAlign: 'center',
+    lineHeight: 24,
+    marginBottom: 12,
+  },
+
+  descModalScroll: {
+    width: '100%',
+    flexGrow: 0,
+    flexShrink: 1,
+  },
+
+  descModalScrollContent: {
+    paddingBottom: 8,
+  },
+
+  descModalCloseBtn: {
+    marginTop: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 28,
+    borderRadius: 999,
+    borderWidth: 1,
+    alignSelf: 'center',
+  },
+
+  descModalCloseText: {
+    fontSize: 16,
   },
   
   descText: {
