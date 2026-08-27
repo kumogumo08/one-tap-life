@@ -16,6 +16,13 @@ import {
   initializePackAccess,
 } from '@/src/lib/characterAccess';
 import { dateKeyLocal } from '@/src/lib/dateKey';
+import {
+  canRecordExtraCompletion,
+  canRecordMainCompletion,
+  decideHomeRestoreKind,
+  extraCompletionKey,
+  shouldKeepIncompleteMainTask,
+} from '@/src/lib/homeRestore';
 import { pickTask } from '@/src/lib/pickTask';
 import {
   defaultPremiumState,
@@ -155,6 +162,10 @@ export default function HomeScreen() {
   const opRef = useRef(false); // ✅ ユーザーが操作したらtrue
   const homeRestoreGenRef = useRef(0);
   const restoreIncompleteMainTaskRef = useRef<(label: string, nextDaily?: DailyState) => void>(() => {});
+  const restoreIncompleteExtraTaskRef = useRef<() => boolean>(() => false);
+  const extraInProgressRef = useRef(false);
+  const currentIsExtraRef = useRef(false);
+  const lastFinishedExtraKeyRef = useRef<string | null>(null);
 
   // 公開版ゲート済みレベルで抽選（保存上の level と食い違わないようにする）
   const availableLevels = getAvailableTaskLevels(progress);
@@ -169,6 +180,8 @@ export default function HomeScreen() {
 
   const [canComplete, setCanComplete] = useState(false);
   const [currentIsExtra, setCurrentIsExtra] = useState(false);
+  extraInProgressRef.current = extraInProgress;
+  currentIsExtraRef.current = currentIsExtra;
   const [praise, setPraise] = useState('');
   const [typedPraise, setTypedPraise] = useState('');
 
@@ -210,7 +223,7 @@ export default function HomeScreen() {
     phase !== 'idle' &&
     !!task &&
     (currentIsExtra
-      ? extraInProgress && canComplete
+      ? extraInProgress
       : daily != null && daily.completed !== true);
 
   const triggerCracker = () => setCrackerTick(t => t + 1);
@@ -243,6 +256,29 @@ export default function HomeScreen() {
     taskY.setValue(0);
   };
   restoreIncompleteMainTaskRef.current = restoreIncompleteMainTask;
+
+  /** 追加タスク表示中のホーム復帰。daily.task は完了済みメインのままなので上書きしない */
+  const restoreIncompleteExtraTask = (): boolean => {
+    if (!extraInProgressRef.current) return false;
+    const label = taskRef.current;
+    if (!label) return false;
+    setPhase('showTask');
+    phaseRef.current = 'showTask';
+    setTyped(label);
+    setCanComplete(true);
+    setCurrentIsExtra(true);
+    setExtraInProgress(true);
+    extraInProgressRef.current = true;
+    currentIsExtraRef.current = true;
+    setDescModalVisible(false);
+    opRef.current = true;
+    btnOpacity.setValue(0);
+    btnScale.setValue(0.95);
+    taskOpacity.setValue(1);
+    taskY.setValue(0);
+    return true;
+  };
+  restoreIncompleteExtraTaskRef.current = restoreIncompleteExtraTask;
 
   // 今日状態を復元（アプリ起動/画面初回/タブ復帰）
   useFocusEffect(
@@ -342,6 +378,19 @@ export default function HomeScreen() {
           if (saved.completed && saved.task) {
             await writeJson(STORAGE_KEYS.daily, saved);
             if (!isCurrent()) return;
+
+            const restoreKind = decideHomeRestoreKind({
+              savedCompleted: true,
+              savedHasTask: true,
+              extraInProgress: extraInProgressRef.current,
+            });
+
+            if (restoreKind === 'incomplete-extra') {
+              setDaily(saved);
+              const kept = restoreIncompleteExtraTaskRef.current();
+              if (kept) return;
+            }
+
             setDaily(saved);
             setTask(saved.task);
             setTyped(saved.task);
@@ -359,24 +408,13 @@ export default function HomeScreen() {
             return;
           }
 
-          // ③.5 未完了だが task がある
-          if (!saved.completed && saved.task) {
-            const shownLevel = saved.taskLevel ?? 1;
-            if (shownLevel !== selectedLevel) {
-              const picked = pickTask(selectedLevel, saved.lastTaskId ?? null);
-              const nextDaily: DailyState = {
-                ...saved,
-                task: picked.label,
-                lastTaskId: picked.id,
-                taskLevel: selectedLevel,
-                completed: false,
-              };
-              await writeJson(STORAGE_KEYS.daily, nextDaily);
-              if (!isCurrent()) return;
-              restoreIncompleteMainTaskRef.current(picked.label, nextDaily);
-              return;
-            }
-
+          // ③.5 未完了だが task がある → 完了まで固定（レベル変更でも再抽選しない）
+          if (
+            shouldKeepIncompleteMainTask({
+              savedCompleted: saved.completed,
+              savedHasTask: !!saved.task,
+            })
+          ) {
             await writeJson(STORAGE_KEYS.daily, saved);
             if (!isCurrent()) return;
             restoreIncompleteMainTaskRef.current(saved.task, saved);
@@ -429,6 +467,8 @@ export default function HomeScreen() {
       if (count >= limit) return;
     
       setExtraInProgress(true);
+      extraInProgressRef.current = true;
+      lastFinishedExtraKeyRef.current = null;
     
       // 先にUI初期化
       taskOpacity.setValue(0);
@@ -444,6 +484,7 @@ export default function HomeScreen() {
       setPhase('animating');
       setCanComplete(true);
       setCurrentIsExtra(true);
+      currentIsExtraRef.current = true;
       setDescModalVisible(false);
       setPraise('');
       setTypedPraise('');
@@ -535,6 +576,30 @@ export default function HomeScreen() {
 
     const onComplete = async () => {
       if (!task || !canSubmitComplete) return;
+
+      const completingExtra = currentIsExtra;
+      if (completingExtra) {
+        const currentKey = extraCompletionKey(task, daily?.lastTaskId);
+        if (
+          !canRecordExtraCompletion({
+            extraInProgress,
+            lastFinishedKey: lastFinishedExtraKeyRef.current,
+            currentKey,
+          })
+        ) {
+          return;
+        }
+      } else if (!canRecordMainCompletion(daily?.completed === true)) {
+        return;
+      }
+
+      if (completingExtra) {
+        lastFinishedExtraKeyRef.current = extraCompletionKey(task, daily?.lastTaskId);
+        extraInProgressRef.current = false;
+        currentIsExtraRef.current = false;
+        setExtraInProgress(false);
+        setCurrentIsExtra(false);
+      }
     
       opRef.current = true;
       setDescModalVisible(false);
@@ -546,7 +611,7 @@ export default function HomeScreen() {
       const historySaved = await addHistory(
         task,
         daily?.lastTaskId,
-        currentIsExtra,
+        completingExtra,
         completedTs
       );
       if (historySaved) {
@@ -555,7 +620,7 @@ export default function HomeScreen() {
         } catch {}
       }
     
-      if (!currentIsExtra) {
+      if (!completingExtra) {
         const nextDaily: DailyState = {
           ...(daily ?? DEFAULT_DAILY_STATE(dateKeyLocal(new Date()))),
           dateKey: dateKeyLocal(new Date()),
