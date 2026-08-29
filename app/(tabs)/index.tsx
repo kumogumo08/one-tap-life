@@ -29,6 +29,7 @@ import {
   shouldKeepCompletedExtraTask,
   shouldKeepCompletedMainTask,
   shouldKeepIncompleteMainTask,
+  shouldPersistMainCompleted,
 } from '@/src/lib/homeRestore';
 import {
   applyNotificationSettings,
@@ -263,6 +264,9 @@ export default function HomeScreen() {
 
   /** 未完了メインタスクを「ワンタップ直後」と同じ操作可能状態にする */
   const restoreIncompleteMainTask = (label: string, nextDaily?: DailyState) => {
+    extraInProgressRef.current = false;
+    currentIsExtraRef.current = false;
+    lastFinishedExtraKeyRef.current = null;
     if (nextDaily) {
       setDaily(nextDaily);
       dailyRef.current = nextDaily;
@@ -395,6 +399,9 @@ export default function HomeScreen() {
             await writeJson(STORAGE_KEYS.daily, fresh);
             await removeKey(STORAGE_KEYS.extraSession);
             extraSessionRef.current = null;
+            extraInProgressRef.current = false;
+            currentIsExtraRef.current = false;
+            lastFinishedExtraKeyRef.current = null;
             if (!isCurrent()) return;
             setDaily(fresh);
             setPhase('idle');
@@ -403,6 +410,8 @@ export default function HomeScreen() {
             setTyped('');
             setTypedPraise('');
             setCanComplete(false);
+            setCurrentIsExtra(false);
+            setExtraInProgress(false);
             setDescModalVisible(false);
             btnOpacity.setValue(1);
             btnScale.setValue(1);
@@ -420,6 +429,9 @@ export default function HomeScreen() {
             await writeJson(STORAGE_KEYS.daily, fresh);
             await removeKey(STORAGE_KEYS.extraSession);
             extraSessionRef.current = null;
+            extraInProgressRef.current = false;
+            currentIsExtraRef.current = false;
+            lastFinishedExtraKeyRef.current = null;
             if (!isCurrent()) return;
             setDaily(fresh);
             setPhase('idle');
@@ -427,6 +439,8 @@ export default function HomeScreen() {
             setTask('');
             setTyped('');
             setCanComplete(false);
+            setCurrentIsExtra(false);
+            setExtraInProgress(false);
             btnOpacity.setValue(1);
             btnScale.setValue(1);
             taskOpacity.setValue(0);
@@ -463,15 +477,54 @@ export default function HomeScreen() {
             memoryDaily.dateKey === todayKey &&
             memoryDaily.completed === true &&
             !!memoryDaily.task;
+          const memoryIncompleteTask =
+            memoryDaily != null &&
+            memoryDaily.dateKey === todayKey &&
+            memoryDaily.completed !== true &&
+            !!memoryDaily.task
+              ? memoryDaily.task
+              : '';
+          const persistedCompleted = shouldPersistMainCompleted({
+            savedCompleted: saved.completed === true,
+            memoryCompleted: keepCompletedMemory,
+          });
+          const incompleteMainLabel = saved.completed !== true
+            ? (saved.task || memoryIncompleteTask)
+            : '';
+          const savedHasTask = !!(
+            saved.task ||
+            (keepCompletedMemory && memoryDaily?.task) ||
+            incompleteMainLabel
+          );
 
           const restoreKind = decideHomeRestoreKind({
-            savedCompleted: saved.completed === true || keepCompletedMemory,
-            savedHasTask: !!(saved.task || (keepCompletedMemory && memoryDaily?.task)),
+            savedCompleted: persistedCompleted,
+            savedHasTask,
             extraInProgress: extraInProgressRef.current,
             extraSessionUsable,
             extraSessionCompleted: todayExtra?.completed === true,
             hasFinishedExtraKey: lastFinishedExtraKeyRef.current !== null,
           });
+
+          // 未完了メインは extra / 完了済み経路より先に復元する。
+          // lastTaskId や stale extra 完了キーで消費扱いにしない。
+          if (
+            restoreKind === 'incomplete-main' ||
+            shouldKeepIncompleteMainTask({
+              savedCompleted: persistedCompleted,
+              savedHasTask: !!incompleteMainLabel,
+            })
+          ) {
+            if (incompleteMainLabel) {
+              const restoreDaily: DailyState = saved.task
+                ? { ...saved, completed: false }
+                : { ...saved, task: incompleteMainLabel, completed: false };
+              await writeJson(STORAGE_KEYS.daily, restoreDaily);
+              if (!isCurrent()) return;
+              restoreIncompleteMainTaskRef.current(incompleteMainLabel, restoreDaily);
+              return;
+            }
+          }
 
           // ③ completed のときは表示復元（メインタスクは維持。追加抽選は新しい activeLevel）
           if (restoreKind === 'incomplete-extra') {
@@ -500,12 +553,13 @@ export default function HomeScreen() {
           }
 
           if (
-            restoreKind === 'completed-main' ||
-            shouldKeepCompletedMainTask({
-              savedCompleted: saved.completed === true || keepCompletedMemory,
-              savedHasTask: !!(saved.task || (keepCompletedMemory && memoryDaily?.task)),
-              extraInProgress: extraInProgressRef.current,
-            })
+            persistedCompleted &&
+            (restoreKind === 'completed-main' ||
+              shouldKeepCompletedMainTask({
+                savedCompleted: persistedCompleted,
+                savedHasTask: !!(saved.task || (keepCompletedMemory && memoryDaily?.task)),
+                extraInProgress: extraInProgressRef.current,
+              }))
           ) {
             const completedExtraLabel = shouldKeepCompletedExtraTask({
               extraInProgress: extraInProgressRef.current,
@@ -545,7 +599,7 @@ export default function HomeScreen() {
                 });
             const keepDaily: DailyState = keepCompletedMemory
               ? { ...memoryDaily!, task: mainTask, completed: true }
-              : { ...saved, task: mainTask, completed: true };
+              : { ...saved, task: mainTask, completed: persistedCompleted };
 
             await writeJson(STORAGE_KEYS.daily, keepDaily);
             if (!isCurrent()) return;
@@ -571,7 +625,7 @@ export default function HomeScreen() {
           // ③.5 未完了だが task がある → 完了まで固定（レベル変更でも再抽選しない）
           if (
             shouldKeepIncompleteMainTask({
-              savedCompleted: saved.completed,
+              savedCompleted: persistedCompleted,
               savedHasTask: !!saved.task,
             })
           ) {

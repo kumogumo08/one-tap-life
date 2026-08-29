@@ -4,6 +4,9 @@
  *
  * extra の未完了判定は extraInProgress のみ。
  * currentIsExtra は完了後も残ることがあるため、復元条件に使わない。
+ *
+ * 今日のメイン未完了（savedCompleted !== true）は extra / lastTaskId /
+ * 完了キーより優先する。画面遷移だけでメインを消費扱いにしない。
  */
 export type HomeRestoreKind =
   | 'incomplete-main'
@@ -20,6 +23,13 @@ export function decideHomeRestoreKind(input: {
   extraSessionCompleted?: boolean;
   hasFinishedExtraKey?: boolean;
 }): HomeRestoreKind {
+  // DailyState.completed が source of truth。
+  // stale extraInProgress / extraSession / lastFinishedExtraKey で
+  // 未完了メインを追加・完了済みへ落としてはいけない。
+  if (input.savedCompleted !== true && input.savedHasTask) {
+    return 'incomplete-main';
+  }
+
   const extraUsable = input.extraSessionUsable === true;
   const extraCompleted = extraUsable && input.extraSessionCompleted === true;
   const extraFinished = extraCompleted || input.hasFinishedExtraKey === true;
@@ -35,15 +45,22 @@ export function decideHomeRestoreKind(input: {
     return extraUsable ? 'completed-extra' : 'completed-main';
   }
 
-  if (input.savedCompleted && input.savedHasTask) {
+  if (input.savedCompleted === true && input.savedHasTask) {
     return 'completed-main';
   }
 
-  if (!input.savedCompleted && input.savedHasTask) {
-    return 'incomplete-main';
-  }
-
   return 'empty';
+}
+
+/**
+ * 完了済みメインとして永続化してよいか。
+ * lastTaskId や extra 一時フラグだけでは true にしない。
+ */
+export function shouldPersistMainCompleted(input: {
+  savedCompleted: boolean;
+  memoryCompleted?: boolean;
+}): boolean {
+  return input.savedCompleted === true || input.memoryCompleted === true;
 }
 
 /** 未完了メインはレベル変更しても再抽選せず、保存済み daily.task を維持する */

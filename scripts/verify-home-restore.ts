@@ -9,6 +9,7 @@ import {
   shouldKeepCompletedExtraTask,
   shouldKeepCompletedMainTask,
   shouldKeepIncompleteMainTask,
+  shouldPersistMainCompleted,
   shouldPickTaskOnHomeRestore,
 } from '@/src/lib/homeRestore';
 import { isUsableExtraSession, normalizeExtraSession } from '@/src/lib/extraSession';
@@ -542,6 +543,146 @@ function run(): void {
       extraSessionCompleted: true,
     }) === false,
     'extraSession.completed なら stale extraInProgress を落とす'
+  );
+
+  // --- 回帰: 未完了メインを画面遷移で消費しない ---
+  const EXTRA = 'ヒップリフト 25回';
+
+  // ケース1: 起動 → メイン未完了 → 設定 → ホーム → 同じ未完了メイン
+  const case1Kind = decideHomeRestoreKind({
+    savedCompleted: false,
+    savedHasTask: true,
+    extraInProgress: false,
+    hasFinishedExtraKey: true,
+    extraSessionUsable: true,
+    extraSessionCompleted: false,
+  });
+  assert(case1Kind === 'incomplete-main', 'ケース1: 設定復帰でも incomplete-main');
+  assert(
+    shouldKeepIncompleteMainTask({ savedCompleted: false, savedHasTask: true }) === true,
+    'ケース1: 未完了メインを維持'
+  );
+  assert(
+    shouldPersistMainCompleted({ savedCompleted: false, memoryCompleted: false }) === false,
+    'ケース1: 永続完了にはしない'
+  );
+  assert(
+    resolveDisplayedTaskAfterHomeRestore({
+      extraInProgress: false,
+      extraLabel: '',
+      memoryCompleted: false,
+      memoryTask: MAIN,
+      savedCompleted: false,
+      savedTask: MAIN,
+    }) === MAIN,
+    'ケース1: 同じメインタスクを表示'
+  );
+  assert(
+    shouldPickTaskOnHomeRestore({
+      extraInProgress: false,
+      savedHasTask: true,
+      savedCompleted: false,
+      memoryHasTask: true,
+      memoryCompleted: false,
+    }) === false,
+    'ケース1: 設定復帰で再抽選しない'
+  );
+
+  // stale extra 完了キーがあっても未完了メインを completed-main にしない
+  assert(
+    decideHomeRestoreKind({
+      savedCompleted: false,
+      savedHasTask: true,
+      extraInProgress: false,
+      hasFinishedExtraKey: true,
+    }) === 'incomplete-main',
+    'stale lastFinishedExtraKey で未完了メインを消費しない'
+  );
+  assert(
+    decideHomeRestoreKind({
+      savedCompleted: false,
+      savedHasTask: true,
+      extraInProgress: true,
+    }) === 'incomplete-main',
+    'stale extraInProgress で未完了メインを追加扱いにしない'
+  );
+
+  // ケース2: 起動 → メイン完了 → 設定 → ホーム → 完了済み維持
+  const case2Kind = decideHomeRestoreKind({
+    savedCompleted: true,
+    savedHasTask: true,
+    extraInProgress: false,
+  });
+  assert(case2Kind === 'completed-main', 'ケース2: 完了済みが維持される');
+  assert(
+    shouldKeepCompletedMainTask({
+      savedCompleted: true,
+      savedHasTask: true,
+      extraInProgress: false,
+    }) === true,
+    'ケース2: 完了済みメイン keep'
+  );
+  assert(
+    shouldPersistMainCompleted({ savedCompleted: true, memoryCompleted: false }) === true,
+    'ケース2: 永続完了を維持'
+  );
+  assert(canRecordMainCompletion(true) === false, 'ケース2: 再完了できない');
+  assert(
+    shouldKeepIncompleteMainTask({ savedCompleted: true, savedHasTask: true }) === false,
+    'ケース2: 未完了として復活しない'
+  );
+
+  // ケース3: メイン完了 → 追加表示 → 設定 → ホーム → メインは未完了に戻らない
+  const case3Kind = decideHomeRestoreKind({
+    savedCompleted: true,
+    savedHasTask: true,
+    extraInProgress: true,
+    extraSessionUsable: true,
+    extraSessionCompleted: false,
+  });
+  assert(case3Kind === 'incomplete-extra', 'ケース3: 追加表示中は incomplete-extra');
+  assert(
+    shouldKeepIncompleteMainTask({ savedCompleted: true, savedHasTask: true }) === false,
+    'ケース3: メインを未完了として復活しない'
+  );
+  assert(
+    resolveDisplayedTaskAfterHomeRestore({
+      extraInProgress: true,
+      extraLabel: EXTRA,
+      memoryCompleted: true,
+      memoryTask: MAIN,
+      savedCompleted: true,
+      savedTask: MAIN,
+    }) === EXTRA,
+    'ケース3: 追加タスクのまま表示'
+  );
+  assert(
+    shouldPersistMainCompleted({ savedCompleted: true, memoryCompleted: true }) === true,
+    'ケース3: メイン完了は維持'
+  );
+
+  // ケース4: cold start → 今日未完了 → 保存済み未完了メインを復元
+  const case4 = resolveColdStartHomeTask({
+    savedTask: MAIN,
+    savedCompleted: false,
+    lastTaskId: 'lv2-calf-stretch-30s',
+  });
+  assert(case4.kind === 'incomplete-main', 'ケース4: cold start は incomplete-main');
+  assert(case4.task === MAIN, 'ケース4: 保存済み未完了メインを復元');
+  assert(case4.task !== CALF, 'ケース4: lastTaskId を表示に使わない');
+  assert(
+    shouldPersistMainCompleted({ savedCompleted: false }) === false,
+    'ケース4: cold start でも未完了のまま'
+  );
+  assert(
+    shouldPickTaskOnHomeRestore({
+      extraInProgress: false,
+      savedHasTask: true,
+      savedCompleted: false,
+      memoryHasTask: false,
+      memoryCompleted: false,
+    }) === false,
+    'ケース4: cold start で再抽選しない'
   );
 
   console.log('homeRestore tests passed');
