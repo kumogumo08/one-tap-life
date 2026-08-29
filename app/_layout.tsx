@@ -6,6 +6,7 @@ import 'react-native-reanimated';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { initializePackAccess } from '@/src/lib/characterAccess';
+import { syncDailyNotification } from '@/src/lib/notifications';
 
 export const unstable_settings = {
   anchor: '(tabs)',
@@ -17,6 +18,8 @@ export default function RootLayout() {
   useEffect(() => {
     // DEV override / 将来の RevenueCat 初期化。完了前は未購入とみなさない
     void initializePackAccess();
+    // 権限は要求しない。通知ONなら現在キャラの本文で再予約する
+    void syncDailyNotification();
   }, []);
 
   return (

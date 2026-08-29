@@ -19,6 +19,7 @@ import {
   isCharacterOwned,
   isPackOwned,
 } from '@/src/lib/characterAccess';
+import { syncDailyNotification } from '@/src/lib/notifications';
 import { readJson, writeJson } from '@/src/lib/storage';
 import { STORAGE_KEYS } from '@/src/lib/storageKeys';
 import type { CharacterId, CharacterPackId } from '@/src/types/character';
@@ -71,6 +72,8 @@ export default function CharacterSelectScreen() {
       level: current.level,
     });
     await writeJson(STORAGE_KEYS.settings, next);
+    // 日次通知の本文が選択キャラに固定されないよう、保存済み設定に合わせて再同期する
+    void syncDailyNotification();
     router.back();
   };
 

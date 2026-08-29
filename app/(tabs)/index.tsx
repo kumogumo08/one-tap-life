@@ -1,7 +1,7 @@
 import { useFocusEffect } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, Easing, ImageBackground, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Alert, Animated, Easing, ImageBackground, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
@@ -16,14 +16,31 @@ import {
   initializePackAccess,
 } from '@/src/lib/characterAccess';
 import { dateKeyLocal } from '@/src/lib/dateKey';
+import type { ExtraSession } from '@/src/lib/extraSession';
+import { isUsableExtraSession, normalizeExtraSession } from '@/src/lib/extraSession';
 import {
   canRecordExtraCompletion,
   canRecordMainCompletion,
   decideHomeRestoreKind,
   extraCompletionKey,
+  resolveColdStartHomeTask,
+  resolveDisplayedTaskAfterHomeRestore,
+  resolveExtraInProgressForRestore,
+  shouldKeepCompletedExtraTask,
+  shouldKeepCompletedMainTask,
   shouldKeepIncompleteMainTask,
 } from '@/src/lib/homeRestore';
+import {
+  applyNotificationSettings,
+  enableDailyNotifications,
+  loadNotificationSettings,
+} from '@/src/lib/notifications';
+import {
+  isFirstTaskCompletion,
+  shouldShowNotificationPrompt,
+} from '@/src/lib/notificationCore';
 import { pickTask } from '@/src/lib/pickTask';
+import { appendRecentTaskId, normalizeRecentTaskIds } from '@/src/lib/recentTaskIds';
 import {
   defaultPremiumState,
   getTrialActive,
@@ -31,7 +48,7 @@ import {
   PremiumState,
 } from '@/src/lib/premium';
 import { ensureUserProgress, getAvailableTaskLevels, recordTaskCompletion } from '@/src/lib/progress';
-import { readJson, writeJson } from '@/src/lib/storage';
+import { readJson, removeKey, writeJson } from '@/src/lib/storage';
 import { STORAGE_KEYS } from '@/src/lib/storageKeys';
 import type { CharacterId } from '@/src/types/character';
 import { DEFAULT_USER_PROGRESS } from '@/src/types/progress';
@@ -48,6 +65,7 @@ import {
   ZenMaruGothic_700Bold,
 } from '@expo-google-fonts/zen-maru-gothic';
 import { useFonts } from 'expo-font';
+import NotificationPromptModal from '@/components/NotificationPromptModal';
 import PraiseCharacter from '@/components/PraiseCharacter';
 
 type ScreenWrapperProps = React.PropsWithChildren;
@@ -161,11 +179,16 @@ export default function HomeScreen() {
 
   const opRef = useRef(false); // ✅ ユーザーが操作したらtrue
   const homeRestoreGenRef = useRef(0);
+  const dailyRef = useRef<DailyState | null>(null);
   const restoreIncompleteMainTaskRef = useRef<(label: string, nextDaily?: DailyState) => void>(() => {});
-  const restoreIncompleteExtraTaskRef = useRef<() => boolean>(() => false);
+  const restoreIncompleteExtraTaskRef = useRef<(label?: string) => boolean>(() => false);
   const extraInProgressRef = useRef(false);
   const currentIsExtraRef = useRef(false);
   const lastFinishedExtraKeyRef = useRef<string | null>(null);
+  const extraSessionRef = useRef<ExtraSession | null>(null);
+  const restoreCompletedExtraTaskRef = useRef<(label: string, taskId: string) => boolean>(
+    () => false
+  );
 
   // 公開版ゲート済みレベルで抽選（保存上の level と食い違わないようにする）
   const availableLevels = getAvailableTaskLevels(progress);
@@ -188,6 +211,11 @@ export default function HomeScreen() {
   const completeBtnRef = useRef<View | null>(null);
   const [crackerTick, setCrackerTick] = useState(0);
   const [crackerOrigin, setCrackerOrigin] = useState<Origin | null>(null);
+  const [notificationPromptPending, setNotificationPromptPending] = useState(false);
+  const [notificationPromptVisible, setNotificationPromptVisible] = useState(false);
+  const [notificationPromptBusy, setNotificationPromptBusy] = useState(false);
+  const notificationPromptShownRef = useRef(false);
+  const notificationPromptVisibleRef = useRef(false);
 
   // ✅ プレミアム完全ロック（この画面内でも保険）
   const PREMIUM_ENABLED = false;
@@ -237,6 +265,7 @@ export default function HomeScreen() {
   const restoreIncompleteMainTask = (label: string, nextDaily?: DailyState) => {
     if (nextDaily) {
       setDaily(nextDaily);
+      dailyRef.current = nextDaily;
     }
     setTask(label);
     setTyped(label);
@@ -258,13 +287,17 @@ export default function HomeScreen() {
   restoreIncompleteMainTaskRef.current = restoreIncompleteMainTask;
 
   /** 追加タスク表示中のホーム復帰。daily.task は完了済みメインのままなので上書きしない */
-  const restoreIncompleteExtraTask = (): boolean => {
-    if (!extraInProgressRef.current) return false;
-    const label = taskRef.current;
+  const restoreIncompleteExtraTask = (labelArg?: string): boolean => {
+    const label = labelArg || taskRef.current;
     if (!label) return false;
+    extraInProgressRef.current = true;
+    currentIsExtraRef.current = true;
+    lastFinishedExtraKeyRef.current = null;
     setPhase('showTask');
     phaseRef.current = 'showTask';
+    setTask(label);
     setTyped(label);
+    taskRef.current = label;
     setCanComplete(true);
     setCurrentIsExtra(true);
     setExtraInProgress(true);
@@ -279,6 +312,30 @@ export default function HomeScreen() {
     return true;
   };
   restoreIncompleteExtraTaskRef.current = restoreIncompleteExtraTask;
+
+  /** 完了済み追加の復元。完了ボタンは出さない */
+  const restoreCompletedExtraTask = (label: string, taskId: string): boolean => {
+    if (!label) return false;
+    extraInProgressRef.current = false;
+    currentIsExtraRef.current = false;
+    lastFinishedExtraKeyRef.current = extraCompletionKey(label, taskId);
+    setPhase('showTask');
+    phaseRef.current = 'showTask';
+    setTask(label);
+    setTyped(label);
+    taskRef.current = label;
+    setCanComplete(false);
+    setCurrentIsExtra(false);
+    setExtraInProgress(false);
+    setDescModalVisible(false);
+    opRef.current = true;
+    btnOpacity.setValue(0);
+    btnScale.setValue(0.95);
+    taskOpacity.setValue(1);
+    taskY.setValue(0);
+    return true;
+  };
+  restoreCompletedExtraTaskRef.current = restoreCompletedExtraTask;
 
   // 今日状態を復元（アプリ起動/画面初回/タブ復帰）
   useFocusEffect(
@@ -336,6 +393,8 @@ export default function HomeScreen() {
           if (rawDaily == null) {
             const fresh = DEFAULT_DAILY_STATE(todayKey);
             await writeJson(STORAGE_KEYS.daily, fresh);
+            await removeKey(STORAGE_KEYS.extraSession);
+            extraSessionRef.current = null;
             if (!isCurrent()) return;
             setDaily(fresh);
             setPhase('idle');
@@ -355,9 +414,12 @@ export default function HomeScreen() {
           const saved = normalizeDailyState(rawDaily, todayKey);
 
           // ① 日付違い → fresh作成（UIも初期化）
+          // recentTaskIds は日またぎ除外のためここでは消さない
           if (saved.dateKey !== todayKey) {
             const fresh = DEFAULT_DAILY_STATE(todayKey);
             await writeJson(STORAGE_KEYS.daily, fresh);
+            await removeKey(STORAGE_KEYS.extraSession);
+            extraSessionRef.current = null;
             if (!isCurrent()) return;
             setDaily(fresh);
             setPhase('idle');
@@ -374,29 +436,127 @@ export default function HomeScreen() {
 
           if (!isCurrent()) return;
 
+          const rawExtraSession = await readJson<unknown>(STORAGE_KEYS.extraSession, null);
+          if (!isCurrent()) return;
+          let persistedExtra = normalizeExtraSession(rawExtraSession);
+          if (persistedExtra && persistedExtra.dateKey !== todayKey) {
+            await removeKey(STORAGE_KEYS.extraSession);
+            persistedExtra = null;
+          }
+          extraSessionRef.current = persistedExtra;
+          const todayExtra = isUsableExtraSession(persistedExtra, todayKey)
+            ? persistedExtra
+            : null;
+          const extraSessionUsable = todayExtra != null;
+
+          const extraInProgressNow = resolveExtraInProgressForRestore({
+            extraInProgress: extraInProgressRef.current,
+            hasFinishedExtraKey: lastFinishedExtraKeyRef.current !== null,
+            extraSessionCompleted: todayExtra?.completed === true,
+          });
+          extraInProgressRef.current = extraInProgressNow;
+
+          const memoryDaily = dailyRef.current;
+          const keepCompletedMemory =
+            !extraInProgressRef.current &&
+            memoryDaily != null &&
+            memoryDaily.dateKey === todayKey &&
+            memoryDaily.completed === true &&
+            !!memoryDaily.task;
+
+          const restoreKind = decideHomeRestoreKind({
+            savedCompleted: saved.completed === true || keepCompletedMemory,
+            savedHasTask: !!(saved.task || (keepCompletedMemory && memoryDaily?.task)),
+            extraInProgress: extraInProgressRef.current,
+            extraSessionUsable,
+            extraSessionCompleted: todayExtra?.completed === true,
+            hasFinishedExtraKey: lastFinishedExtraKeyRef.current !== null,
+          });
+
           // ③ completed のときは表示復元（メインタスクは維持。追加抽選は新しい activeLevel）
-          if (saved.completed && saved.task) {
+          if (restoreKind === 'incomplete-extra') {
             await writeJson(STORAGE_KEYS.daily, saved);
             if (!isCurrent()) return;
-
-            const restoreKind = decideHomeRestoreKind({
-              savedCompleted: true,
-              savedHasTask: true,
-              extraInProgress: extraInProgressRef.current,
-            });
-
-            if (restoreKind === 'incomplete-extra') {
-              setDaily(saved);
-              const kept = restoreIncompleteExtraTaskRef.current();
-              if (kept) return;
-            }
-
             setDaily(saved);
-            setTask(saved.task);
-            setTyped(saved.task);
+            dailyRef.current = saved;
+            const extraLabel =
+              todayExtra && !todayExtra.completed
+                ? todayExtra.taskLabel
+                : taskRef.current;
+            const kept = restoreIncompleteExtraTaskRef.current(extraLabel);
+            if (kept) return;
+          }
+
+          if (restoreKind === 'completed-extra' && todayExtra) {
+            await writeJson(STORAGE_KEYS.daily, saved);
+            if (!isCurrent()) return;
+            setDaily(saved);
+            dailyRef.current = saved;
+            const kept = restoreCompletedExtraTaskRef.current(
+              todayExtra.taskLabel,
+              todayExtra.taskId
+            );
+            if (kept) return;
+          }
+
+          if (
+            restoreKind === 'completed-main' ||
+            shouldKeepCompletedMainTask({
+              savedCompleted: saved.completed === true || keepCompletedMemory,
+              savedHasTask: !!(saved.task || (keepCompletedMemory && memoryDaily?.task)),
+              extraInProgress: extraInProgressRef.current,
+            })
+          ) {
+            const completedExtraLabel = shouldKeepCompletedExtraTask({
+              extraInProgress: extraInProgressRef.current,
+              hasFinishedExtraKey: lastFinishedExtraKeyRef.current !== null,
+              extraLabel: taskRef.current,
+            })
+              ? taskRef.current
+              : '';
+            const extraSession = extraInProgressRef.current || !!completedExtraLabel;
+            const coldStart = resolveColdStartHomeTask({
+              savedTask: saved.task,
+              savedCompleted: saved.completed === true || keepCompletedMemory,
+              lastTaskId: saved.lastTaskId,
+            });
+            const mainTask = keepCompletedMemory
+              ? memoryDaily!.task
+              : saved.task;
+            const keepTask = extraSession
+              ? resolveDisplayedTaskAfterHomeRestore({
+                  extraInProgress: extraInProgressRef.current,
+                  extraLabel: taskRef.current,
+                  completedExtraLabel,
+                  memoryCompleted: keepCompletedMemory,
+                  memoryTask: keepCompletedMemory ? memoryDaily!.task : '',
+                  savedCompleted: saved.completed === true,
+                  savedTask: saved.task,
+                })
+              : coldStart.task ||
+                resolveDisplayedTaskAfterHomeRestore({
+                  extraInProgress: false,
+                  extraLabel: '',
+                  completedExtraLabel: '',
+                  memoryCompleted: keepCompletedMemory,
+                  memoryTask: keepCompletedMemory ? memoryDaily!.task : '',
+                  savedCompleted: saved.completed === true,
+                  savedTask: saved.task,
+                });
+            const keepDaily: DailyState = keepCompletedMemory
+              ? { ...memoryDaily!, task: mainTask, completed: true }
+              : { ...saved, task: mainTask, completed: true };
+
+            await writeJson(STORAGE_KEYS.daily, keepDaily);
+            if (!isCurrent()) return;
+
+            setDaily(keepDaily);
+            dailyRef.current = keepDaily;
+            setTask(keepTask);
+            setTyped(keepTask);
             setPhase('showTask');
             phaseRef.current = 'showTask';
-            taskRef.current = saved.task;
+            taskRef.current = keepTask;
             setCanComplete(false);
             setCurrentIsExtra(false);
             setDescModalVisible(false);
@@ -475,8 +635,11 @@ export default function HomeScreen() {
       taskY.setValue(8);
     
       try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {}
-    
-      const picked = pickTask(activeLevel, daily.lastTaskId ?? null);
+
+      const recentTaskIds = normalizeRecentTaskIds(
+        await readJson<unknown>(STORAGE_KEYS.recentTaskIds, null)
+      );
+      const picked = pickTask(activeLevel, daily.lastTaskId ?? null, recentTaskIds);
     
       // ✅ UI先
       setTask(picked.label);
@@ -491,13 +654,26 @@ export default function HomeScreen() {
     
       const nextDaily: DailyState = { ...daily, lastTaskId: picked.id };
       setDaily(nextDaily);
+      dailyRef.current = nextDaily;
+
+      const extraSession: ExtraSession = {
+        dateKey: dateKeyLocal(new Date()),
+        taskId: picked.id,
+        taskLabel: picked.label,
+        completed: false,
+      };
+      extraSessionRef.current = extraSession;
     
       Animated.parallel([
         Animated.timing(taskOpacity, { toValue: 1, duration: 420, easing: Easing.out(Easing.quad), useNativeDriver: true }),
         Animated.timing(taskY, { toValue: 0, duration: 420, easing: Easing.out(Easing.quad), useNativeDriver: true }),
       ]).start(() => setPhase('showTask'));
     
-      // ✅ 保存は後追い
+      await writeJson(
+        STORAGE_KEYS.recentTaskIds,
+        appendRecentTaskId(recentTaskIds, picked.id)
+      );
+      await writeJson(STORAGE_KEYS.extraSession, extraSession);
       await writeJson(STORAGE_KEYS.daily, nextDaily);
     }; 
 
@@ -524,8 +700,15 @@ export default function HomeScreen() {
       if (baseDaily.completed) return;
     
       try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); } catch {}
-    
-      const picked = baseDaily.task ? null : pickTask(activeLevel, baseDaily.lastTaskId ?? null);
+
+      const recentTaskIds = baseDaily.task
+        ? []
+        : normalizeRecentTaskIds(
+            await readJson<unknown>(STORAGE_KEYS.recentTaskIds, null)
+          );
+      const picked = baseDaily.task
+        ? null
+        : pickTask(activeLevel, baseDaily.lastTaskId ?? null, recentTaskIds);
       const todayTask = baseDaily.task || picked?.label || '水をコップ1杯飲む';
     
       // ✅ ここで task を確定（表示は typed||task なので即見える）
@@ -541,6 +724,13 @@ export default function HomeScreen() {
       };
     
       setDaily(nextDaily);
+      dailyRef.current = nextDaily;
+      if (picked) {
+        await writeJson(
+          STORAGE_KEYS.recentTaskIds,
+          appendRecentTaskId(recentTaskIds, picked.id)
+        );
+      }
       await writeJson(STORAGE_KEYS.daily, nextDaily);
     
       Animated.parallel([
@@ -561,6 +751,10 @@ export default function HomeScreen() {
     useEffect(() => {
       taskRef.current = task;
     }, [task]);
+
+    useEffect(() => {
+      dailyRef.current = daily;
+    }, [daily]);
 
     useEffect(() => {
       setDescModalVisible(false);
@@ -593,6 +787,18 @@ export default function HomeScreen() {
         return;
       }
 
+      // 完了ボタンが消える前に原点を測って演出を発火する
+      const btn = completeBtnRef.current as { measureInWindow?: Function } | null;
+      if (btn?.measureInWindow) {
+        btn.measureInWindow((x: number, y: number, w: number, h: number) => {
+          setCrackerOrigin({ x: x + w / 2, y: y + h / 2 });
+          triggerCracker();
+        });
+      } else {
+        setCrackerOrigin(null);
+        triggerCracker();
+      }
+
       if (completingExtra) {
         lastFinishedExtraKeyRef.current = extraCompletionKey(task, daily?.lastTaskId);
         extraInProgressRef.current = false;
@@ -605,6 +811,46 @@ export default function HomeScreen() {
       setDescModalVisible(false);
     
       try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
+
+      // 完了フラグは履歴より先に保存する。
+      // さもないと最初のホーム復帰が未完了 snapshot を読み、レベル変更と結びついて別タスクに見える。
+      if (!completingExtra) {
+        const nextDaily: DailyState = {
+          ...(daily ?? DEFAULT_DAILY_STATE(dateKeyLocal(new Date()))),
+          dateKey: dateKeyLocal(new Date()),
+          task,
+          completed: true,
+          completedTs: Date.now(),
+          extraCount: daily?.extraCount ?? 0,
+          lastTaskId: daily?.lastTaskId ?? null,
+          taskLevel: daily?.taskLevel ?? activeLevel,
+        };
+        dailyRef.current = nextDaily;
+        setDaily(nextDaily);
+        await writeJson(STORAGE_KEYS.daily, nextDaily);
+      } else {
+        const extraSession: ExtraSession = {
+          dateKey: dateKeyLocal(new Date()),
+          taskId: extraSessionRef.current?.taskId || daily?.lastTaskId || '',
+          taskLabel: task,
+          completed: true,
+        };
+        extraSessionRef.current = extraSession;
+        await writeJson(STORAGE_KEYS.extraSession, extraSession);
+
+        const nextDaily: DailyState = {
+          ...(daily ?? {
+            ...DEFAULT_DAILY_STATE(dateKeyLocal(new Date())),
+            completed: true,
+          }),
+          completed: true,
+          extraCount: (daily?.extraCount ?? 0) + 1,
+          lastTaskId: daily?.lastTaskId ?? null,
+        };
+        dailyRef.current = nextDaily;
+        setDaily(nextDaily);
+        await writeJson(STORAGE_KEYS.daily, nextDaily);
+      }
     
       // 履歴に保存（ここが唯一の addHistory）。成功時のみ進捗を加算する
       const completedTs = Date.now();
@@ -620,32 +866,7 @@ export default function HomeScreen() {
         } catch {}
       }
     
-      if (!completingExtra) {
-        const nextDaily: DailyState = {
-          ...(daily ?? DEFAULT_DAILY_STATE(dateKeyLocal(new Date()))),
-          dateKey: dateKeyLocal(new Date()),
-          task,
-          completed: true,
-          completedTs: Date.now(),
-          extraCount: daily?.extraCount ?? 0,
-          lastTaskId: daily?.lastTaskId ?? null,
-          taskLevel: daily?.taskLevel ?? activeLevel,
-        };
-        setDaily(nextDaily);
-        await writeJson(STORAGE_KEYS.daily, nextDaily);
-      } else {
-        const nextDaily: DailyState = {
-          ...(daily ?? {
-            ...DEFAULT_DAILY_STATE(dateKeyLocal(new Date())),
-            completed: true,
-          }),
-          completed: true,
-          extraCount: (daily?.extraCount ?? 0) + 1,
-          lastTaskId: daily?.lastTaskId ?? null,
-        };
-        setDaily(nextDaily);
-        await writeJson(STORAGE_KEYS.daily, nextDaily);
-    
+      if (completingExtra) {
         opRef.current = false;
       }
     
@@ -656,21 +877,17 @@ export default function HomeScreen() {
       setTypedPraise('');          // 表示を一旦消す
       setPraise(msg);              // 元文をセット
       setPraiseTick(t => t + 1);   // ✅ 同じmsgでも effect を必ず走らせる
-    
-      // 完了ボタンの位置からクラッカー
-      const done = () => {
-        triggerCracker();
-        setExtraInProgress(false);
-      };
-    
-      if (completeBtnRef.current && (completeBtnRef.current as any).measureInWindow) {
-        (completeBtnRef.current as any).measureInWindow((x: number, y: number, w: number, h: number) => {
-          setCrackerOrigin({ x: x + w / 2, y: y + h / 2 });
-          done();
-        });
-      } else {
-        setCrackerOrigin(null);
-        done();
+
+      // 完了本処理の後に後付け。保存・演出を待たせない
+      if (
+        shouldShowNotificationPrompt({
+          notificationPromptShown: notificationPromptShownRef.current,
+          isFirstCompletion: isFirstTaskCompletion(progress),
+        })
+      ) {
+        notificationPromptShownRef.current = true;
+        setNotificationPromptPending(true);
+        void applyNotificationSettings({ notificationPromptShown: true });
       }
     };    
 
@@ -720,6 +937,67 @@ useEffect(() => {
 
   return () => clearInterval(id);
 }, [praise, praiseTick]);
+
+useEffect(() => {
+  void loadNotificationSettings().then((settings) => {
+    if (settings.notificationPromptShown) {
+      notificationPromptShownRef.current = true;
+    }
+  });
+}, []);
+
+useEffect(() => {
+  if (!notificationPromptPending) return;
+  if (notificationPromptVisibleRef.current) return;
+  if (!praise || typedPraise !== praise) return;
+
+  const timer = setTimeout(() => {
+    if (notificationPromptVisibleRef.current) return;
+    notificationPromptVisibleRef.current = true;
+    setNotificationPromptPending(false);
+    setNotificationPromptVisible(true);
+  }, 700);
+
+  return () => clearTimeout(timer);
+}, [notificationPromptPending, praise, typedPraise]);
+
+const closeNotificationPrompt = useCallback(() => {
+  notificationPromptVisibleRef.current = false;
+  setNotificationPromptVisible(false);
+  setNotificationPromptPending(false);
+  setNotificationPromptBusy(false);
+}, []);
+
+const skipNotificationPrompt = useCallback(() => {
+  if (notificationPromptBusy) return;
+  notificationPromptShownRef.current = true;
+  closeNotificationPrompt();
+}, [closeNotificationPrompt, notificationPromptBusy]);
+
+const enableNotificationPrompt = useCallback(async () => {
+  if (notificationPromptBusy) return;
+  setNotificationPromptBusy(true);
+  notificationPromptShownRef.current = true;
+  try {
+    const result = await enableDailyNotifications({
+      notificationHour: 20,
+      notificationMinute: 0,
+    });
+    if (!result.granted) {
+      Alert.alert(
+        '通知が許可されていません',
+        '後から端末の設定またはアプリの設定から変更できます。'
+      );
+    }
+  } catch {
+    Alert.alert(
+      '通知が許可されていません',
+      '後から端末の設定またはアプリの設定から変更できます。'
+    );
+  } finally {
+    closeNotificationPrompt();
+  }
+}, [closeNotificationPrompt, notificationPromptBusy]);
 
 const currentDesc = getDescriptionByLabel(task);
 
@@ -917,6 +1195,13 @@ if (!fontsLoaded) {
           </Pressable>
         </View>
       </Modal>
+
+      <NotificationPromptModal
+        visible={notificationPromptVisible}
+        busy={notificationPromptBusy}
+        onEnable={() => void enableNotificationPrompt()}
+        onSkip={skipNotificationPrompt}
+      />
     </ScreenWrapper>
   );
 }

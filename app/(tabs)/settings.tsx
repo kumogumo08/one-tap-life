@@ -3,8 +3,8 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
-import React, { useCallback, useState } from 'react';
-import { Alert, Image, Linking, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import React, { useCallback, useRef, useState } from 'react';
+import { Alert, Image, Linking, Modal, Pressable, ScrollView, StyleSheet, Switch, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
@@ -24,6 +24,15 @@ import {
   setDevFamilyPackOverride,
   type DevFamilyPackOverride,
 } from '@/src/lib/characterAccess';
+import {
+  applyNotificationSettings,
+  enableDailyNotifications,
+  loadNotificationSettings,
+} from '@/src/lib/notifications';
+import {
+  NOTIFICATION_HOUR_PRESETS,
+  formatNotificationTime,
+} from '@/src/lib/notificationCore';
 import { restoreFamilyPackPurchases } from '@/src/lib/revenueCat';
 import {
   defaultPremiumState,
@@ -41,6 +50,10 @@ import { readJson, removeKey, writeJson } from '@/src/lib/storage';
 import { STORAGE_KEYS } from '@/src/lib/storageKeys';
 import type { CharacterId } from '@/src/types/character';
 import { DEFAULT_USER_PROGRESS, type UserProgress } from '@/src/types/progress';
+import {
+  DEFAULT_NOTIFICATION_SETTINGS,
+  type NotificationSettings,
+} from '@/src/types/notificationSettings';
 import type { TaskLevel } from '@/src/types/storage';
 import {
   normalizeAvailableLevel,
@@ -67,6 +80,18 @@ export default function SettingsScreen() {
   const currentCharacter = getCharacterById(
     ensureOwnedCharacterId(selectedCharacterId)
   );
+  const [notificationSettings, setNotificationSettings] =
+    useState<NotificationSettings>(DEFAULT_NOTIFICATION_SETTINGS);
+  const [notificationHelpVisible, setNotificationHelpVisible] = useState(false);
+  const notificationBusyRef = useRef(false);
+  const isDark = colorScheme === 'dark';
+  const modalBackground = isDark ? '#1C1C1E' : '#F7FAFC';
+  const modalText = isDark ? Colors.dark.text : '#5C7EA6';
+  const modalOverlay = isDark ? 'rgba(0, 0, 0, 0.55)' : 'rgba(0, 0, 0, 0.35)';
+  const modalCardBorder = isDark ? 'rgba(255,255,255,0.12)' : 'transparent';
+  const modalCloseBg = isDark ? '#2C3136' : Colors.light.tint;
+  const modalCloseBorder = isDark ? '#687076' : 'transparent';
+  const modalCloseText = isDark ? Colors.dark.text : '#fff';
 
   const saveLevel = async (lv: TaskLevel) => {
     const currentProgress = await ensureUserProgress();
@@ -82,6 +107,49 @@ export default function SettingsScreen() {
       level: lv,
     });
     await writeJson(STORAGE_KEYS.settings, next);
+  };
+
+  const onToggleNotifications = async (enabled: boolean) => {
+    if (notificationBusyRef.current) return;
+    notificationBusyRef.current = true;
+    try {
+      if (enabled) {
+        const result = await enableDailyNotifications();
+        setNotificationSettings(result.settings);
+        if (!result.granted) {
+          Alert.alert(
+            '通知が許可されていません',
+            '後から端末の設定またはアプリの設定から変更できます。'
+          );
+        }
+      } else {
+        const next = await applyNotificationSettings({
+          notificationsEnabled: false,
+        });
+        setNotificationSettings(next);
+      }
+    } catch {
+      Alert.alert(
+        '通知が許可されていません',
+        '後から端末の設定またはアプリの設定から変更できます。'
+      );
+    } finally {
+      notificationBusyRef.current = false;
+    }
+  };
+
+  const onSelectNotificationHour = async (hour: number) => {
+    if (notificationBusyRef.current) return;
+    notificationBusyRef.current = true;
+    try {
+      const next = await applyNotificationSettings({
+        notificationHour: hour,
+        notificationMinute: 0,
+      });
+      setNotificationSettings(next);
+    } finally {
+      notificationBusyRef.current = false;
+    }
   };
   
   // プレミアム状態（表示用にも使える）
@@ -152,6 +220,12 @@ export default function SettingsScreen() {
     } catch {
       setSelectedCharacterId(DEFAULT_CHARACTER_ID);
       setLevel(1);
+    }
+
+    try {
+      setNotificationSettings(await loadNotificationSettings());
+    } catch {
+      setNotificationSettings(DEFAULT_NOTIFICATION_SETTINGS);
     }
   
     if (__DEV__) {
@@ -232,6 +306,7 @@ export default function SettingsScreen() {
         onPress: async () => {
           try {
             await removeKey(STORAGE_KEYS.daily);
+            await removeKey(STORAGE_KEYS.extraSession);
         
             // 設定画面の表示も更新（任意）
             await load();
@@ -285,6 +360,7 @@ export default function SettingsScreen() {
           try {
             await AsyncStorage.multiRemove([
               STORAGE_KEYS.daily,
+              STORAGE_KEYS.extraSession,
               STORAGE_KEYS.premium,
               STORAGE_KEYS.devFamilyPackOverride,
             ]);
@@ -376,6 +452,68 @@ export default function SettingsScreen() {
           </ThemedText>
         </View>
 
+        {/* ===== 通知 ===== */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <ThemedText style={[styles.sectionTitle, styles.sectionTitleInHeader]}>
+              通知
+            </ThemedText>
+            <Pressable
+              onPress={() => setNotificationHelpVisible(true)}
+              style={styles.helpLink}
+              accessibilityRole="button"
+              accessibilityLabel="この通知について"
+            >
+              <ThemedText style={styles.helpLinkText}>ⓘ この通知について</ThemedText>
+            </Pressable>
+          </View>
+
+          <View style={styles.row}>
+            <ThemedText style={styles.notificationLabel}>毎日のリマインダー</ThemedText>
+            <Switch
+              value={notificationSettings.notificationsEnabled}
+              onValueChange={(enabled) => void onToggleNotifications(enabled)}
+              trackColor={{ false: '#D0D5DD', true: theme.tint }}
+              thumbColor="#fff"
+              accessibilityRole="switch"
+              accessibilityLabel="毎日のリマインダー"
+            />
+          </View>
+
+          <ThemedText style={styles.note}>
+            {formatNotificationTime(
+              notificationSettings.notificationHour,
+              notificationSettings.notificationMinute
+            )}
+            にお知らせします
+          </ThemedText>
+
+          <View style={styles.timeRow}>
+            {NOTIFICATION_HOUR_PRESETS.map((hour) => {
+              const selected =
+                notificationSettings.notificationHour === hour &&
+                notificationSettings.notificationMinute === 0;
+              return (
+                <Pressable
+                  key={hour}
+                  onPress={() => void onSelectNotificationHour(hour)}
+                  style={[
+                    styles.timeChip,
+                    { borderColor: theme.tint },
+                    selected && styles.timeChipActive,
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected }}
+                >
+                  <ThemedText style={styles.timeChipText}>
+                    {formatNotificationTime(hour, 0)}
+                  </ThemedText>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+
         {/* ===== アプリ情報 ===== */}
         <View style={styles.section}>
           <ThemedText style={styles.sectionTitle}>アプリ情報</ThemedText>
@@ -462,6 +600,65 @@ export default function SettingsScreen() {
         </View>
       )}
       </ScrollView>
+
+      <Modal
+        visible={notificationHelpVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setNotificationHelpVisible(false)}
+      >
+        <View style={styles.descModalRoot}>
+          <Pressable
+            style={[styles.descModalBackdrop, { backgroundColor: modalOverlay }]}
+            onPress={() => setNotificationHelpVisible(false)}
+            accessibilityRole="button"
+            accessibilityLabel="説明を閉じる"
+          />
+          <Pressable
+            style={[
+              styles.descModalCard,
+              {
+                backgroundColor: modalBackground,
+                borderColor: modalCardBorder,
+              },
+            ]}
+            onPress={() => {}}
+          >
+            <ThemedText style={[styles.descModalHeading, { color: modalText }]}>
+              忘れていたら、お知らせします
+            </ThemedText>
+            <ScrollView
+              style={styles.descModalScroll}
+              contentContainerStyle={styles.descModalScrollContent}
+              showsVerticalScrollIndicator={false}
+              bounces={false}
+            >
+              <ThemedText style={[styles.descText, { color: modalText }]}>
+                その日のワンタップがまだ終わっていないときだけ、設定した時間に通知します。
+              </ThemedText>
+              <ThemedText style={[styles.descText, styles.descTextSpaced, { color: modalText }]}>
+                朝や昼にすでに完了していれば、その日の通知は届きません。
+              </ThemedText>
+              <ThemedText style={[styles.descText, styles.descTextSpaced, { color: modalText }]}>
+                『今日まだだった！』を防ぐための、やり忘れ防止リマインダーです。
+              </ThemedText>
+            </ScrollView>
+            <Pressable
+              onPress={() => setNotificationHelpVisible(false)}
+              style={[
+                styles.descModalCloseBtn,
+                { backgroundColor: modalCloseBg, borderColor: modalCloseBorder },
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel="閉じる"
+            >
+              <ThemedText style={[styles.descModalCloseText, { color: modalCloseText }]}>
+                閉じる
+              </ThemedText>
+            </Pressable>
+          </Pressable>
+        </View>
+      </Modal>
     </ThemedView>
   </SafeAreaView>
 );
@@ -473,12 +670,113 @@ const styles = StyleSheet.create({
  
   section: { marginTop: 16 },
   sectionTitle: { fontSize: 14, fontWeight: '700', opacity: 0.7, marginBottom: 10 },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    gap: 8,
+  },
+  sectionTitleInHeader: {
+    marginBottom: 0,
+  },
+  helpLink: {
+    paddingVertical: 2,
+    paddingHorizontal: 2,
+    flexShrink: 0,
+  },
+  helpLinkText: {
+    fontSize: 12,
+    fontWeight: '700',
+    opacity: 0.7,
+  },
+  descModalRoot: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 28,
+  },
+  descModalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  descModalCard: {
+    width: '100%',
+    maxWidth: 340,
+    maxHeight: '70%',
+    borderRadius: 20,
+    borderWidth: 1,
+    paddingHorizontal: 20,
+    paddingTop: 22,
+    paddingBottom: 18,
+    alignItems: 'center',
+    zIndex: 1,
+    elevation: 4,
+  },
+  descModalHeading: {
+    fontSize: 18,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  descModalScroll: {
+    width: '100%',
+    flexGrow: 0,
+    flexShrink: 1,
+  },
+  descModalScrollContent: {
+    paddingBottom: 8,
+  },
+  descModalCloseBtn: {
+    marginTop: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 28,
+    borderRadius: 999,
+    borderWidth: 1,
+    alignSelf: 'center',
+  },
+  descModalCloseText: {
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  descText: {
+    textAlign: 'center',
+    fontSize: 14,
+    lineHeight: 20,
+    opacity: 0.95,
+  },
+  descTextSpaced: {
+    marginTop: 12,
+  },
 
   row: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 8,
+  },
+  notificationLabel: {
+    fontWeight: '700',
+    fontSize: 16,
+  },
+  timeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 10,
+  },
+  timeChip: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  timeChipActive: {
+    opacity: 1,
+    borderWidth: 2,
+  },
+  timeChipText: {
+    fontWeight: '700',
+    fontSize: 13,
   },
 
   safe: { flex: 1 },
