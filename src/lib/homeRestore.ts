@@ -163,6 +163,8 @@ export function resolveDisplayedTaskAfterHomeRestore(input: {
  * アプリ完全再起動（cold start）。extra の memory / lastTaskId は使わない。
  * lastTaskId は追加抽選の直前 ID であり、完了済み追加のラベルではない。
  * 固定フォールバック（ふくらはぎ伸ばし等）や pickTask は使わない。
+ *
+ * 保存済みタスクの識別用。画面に出すかは resolveHomeRestoreView が決める。
  */
 export function resolveColdStartHomeTask(input: {
   savedTask: string;
@@ -179,6 +181,97 @@ export function resolveColdStartHomeTask(input: {
     return { task, kind: 'completed-main' };
   }
   return { task, kind: 'incomplete-main' };
+}
+
+/** Home 中央の表示状態。idle と completed は別物 */
+export type HomeRestorePhase = 'idle' | 'showTask' | 'completed';
+
+export type HomeRestoreView = {
+  kind: HomeRestoreKind;
+  task: string;
+  canComplete: boolean;
+  phase: HomeRestorePhase;
+  extraInProgress: boolean;
+  currentIsExtra: boolean;
+};
+
+/**
+ * 通常起動 / 通知 cold start / foreground 復帰で共通の表示決定。
+ * lastTaskId は表示に使わない。pickTask もしない。
+ *
+ * idle = 今日まだ未実施（ワンタップ待ち）
+ * showTask = 未完了タスクを表示（完了ボタンあり）
+ * completed = 今日のメインは達成済み（完了ボタンなし・タスクは未完了として出さない）
+ */
+export function resolveHomeRestoreView(input: {
+  savedTask: string;
+  savedCompleted: boolean;
+  lastTaskId?: string | null;
+  extraInProgress?: boolean;
+  extraSessionUsable?: boolean;
+  extraSessionCompleted?: boolean;
+  extraLabel?: string;
+  hasFinishedExtraKey?: boolean;
+  savedHasTask?: boolean;
+  /** 互換のため残す。完了済み表示はセッション有無で変えない */
+  hasSessionMemory?: boolean;
+}): HomeRestoreView {
+  void input.lastTaskId;
+  void input.hasSessionMemory;
+  const savedTask = typeof input.savedTask === 'string' ? input.savedTask : '';
+  const extraLabel = typeof input.extraLabel === 'string' ? input.extraLabel : '';
+  const savedHasTask = input.savedHasTask ?? savedTask.length > 0;
+
+  const kind = decideHomeRestoreKind({
+    savedCompleted: input.savedCompleted === true,
+    savedHasTask,
+    extraInProgress: input.extraInProgress === true,
+    extraSessionUsable: input.extraSessionUsable,
+    extraSessionCompleted: input.extraSessionCompleted,
+    hasFinishedExtraKey: input.hasFinishedExtraKey,
+  });
+
+  if (kind === 'incomplete-main' && savedTask) {
+    return {
+      kind,
+      task: savedTask,
+      canComplete: true,
+      phase: 'showTask',
+      extraInProgress: false,
+      currentIsExtra: false,
+    };
+  }
+
+  if (kind === 'incomplete-extra' && extraLabel) {
+    return {
+      kind,
+      task: extraLabel,
+      canComplete: true,
+      phase: 'showTask',
+      extraInProgress: true,
+      currentIsExtra: true,
+    };
+  }
+
+  if (kind === 'completed-extra' || kind === 'completed-main') {
+    return {
+      kind,
+      task: '',
+      canComplete: false,
+      phase: 'completed',
+      extraInProgress: false,
+      currentIsExtra: false,
+    };
+  }
+
+  return {
+    kind: 'empty',
+    task: '',
+    canComplete: false,
+    phase: 'idle',
+    extraInProgress: false,
+    currentIsExtra: false,
+  };
 }
 
 export function extraCompletionKey(

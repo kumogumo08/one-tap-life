@@ -24,6 +24,8 @@ export type DailyState = {
   lastTaskId?: string | null;
   /** 今日のメインタスクのレベル。旧データには無い */
   taskLevel?: TaskLevel;
+  /** 直近の完了で選んだ褒め言葉。旧データには無い */
+  praise?: string;
 };
 
 export type HistoryItem = {
@@ -147,6 +149,9 @@ export function normalizeDailyState(value: unknown, todayKey: string): DailyStat
     raw.taskLevel === 1 || raw.taskLevel === 2 || raw.taskLevel === 3
       ? raw.taskLevel
       : undefined;
+  const praise = typeof raw.praise === 'string' && raw.praise.length > 0
+    ? raw.praise
+    : undefined;
 
   return {
     dateKey,
@@ -156,6 +161,7 @@ export function normalizeDailyState(value: unknown, todayKey: string): DailyStat
     extraCount,
     lastTaskId,
     taskLevel,
+    praise,
   };
 }
 

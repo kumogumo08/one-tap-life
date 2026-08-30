@@ -17,20 +17,21 @@ import {
 } from '@/src/lib/characterAccess';
 import { dateKeyLocal } from '@/src/lib/dateKey';
 import type { ExtraSession } from '@/src/lib/extraSession';
-import { isUsableExtraSession, normalizeExtraSession } from '@/src/lib/extraSession';
+import { normalizeExtraSession } from '@/src/lib/extraSession';
 import {
   canRecordExtraCompletion,
   canRecordMainCompletion,
-  decideHomeRestoreKind,
   extraCompletionKey,
-  resolveColdStartHomeTask,
-  resolveDisplayedTaskAfterHomeRestore,
-  resolveExtraInProgressForRestore,
-  shouldKeepCompletedExtraTask,
-  shouldKeepCompletedMainTask,
-  shouldKeepIncompleteMainTask,
-  shouldPersistMainCompleted,
 } from '@/src/lib/homeRestore';
+import {
+  canCompleteHome,
+  canShowExtraHome,
+  DEFAULT_HOME_EXTRA_LIMIT,
+  displayedPraise,
+  displayedTaskLabel,
+  resolveHomeState,
+  type HomeState,
+} from '@/src/lib/homeState';
 import {
   applyNotificationSettings,
   enableDailyNotifications,
@@ -94,7 +95,8 @@ const screenWrapperStyles = StyleSheet.create({
   },
 });
 
-type Phase = 'idle' | 'animating' | 'showTask';
+/** タスク出現アニメだけ。ドメイン状態は HomeState.status */
+type AnimationPhase = 'idle' | 'animating' | 'settled';
 
 type Origin = { x: number; y: number };
 
@@ -161,15 +163,15 @@ export default function HomeScreen() {
 
   // ✅ まず state（pickTask が daily を参照するため）
   const [daily, setDaily] = useState<DailyState | null>(null);
+  const [homeState, setHomeState] = useState<HomeState>(() => ({
+    status: 'idle',
+    dateKey: dateKeyLocal(new Date()),
+  }));
 
-  const [phase, setPhase] = useState<Phase>('idle');
-  const [task, setTask] = useState<string>('');
-  const phaseRef = useRef<Phase>('idle');
-  const taskRef = useRef<string>('');
+  const [animationPhase, setAnimationPhase] = useState<AnimationPhase>('idle');
   const [typed, setTyped] = useState<string>('');
   const [selectedCharacterId, setSelectedCharacterId] =
     useState<CharacterId>(DEFAULT_CHARACTER_ID);
-  const [extraInProgress, setExtraInProgress] = useState(false);
   const [level, setLevel] = useState<TaskLevel>(1);
   const [progress, setProgress] = useState(DEFAULT_USER_PROGRESS);
   const [ready, setReady] = useState(false);
@@ -178,18 +180,16 @@ export default function HomeScreen() {
 
   const [premiumState, setPremiumState] = useState<PremiumState>(defaultPremiumState);
 
-  const opRef = useRef(false); // ✅ ユーザーが操作したらtrue
+  const opRef = useRef(false);
   const homeRestoreGenRef = useRef(0);
   const dailyRef = useRef<DailyState | null>(null);
-  const restoreIncompleteMainTaskRef = useRef<(label: string, nextDaily?: DailyState) => void>(() => {});
-  const restoreIncompleteExtraTaskRef = useRef<(label?: string) => boolean>(() => false);
-  const extraInProgressRef = useRef(false);
-  const currentIsExtraRef = useRef(false);
   const lastFinishedExtraKeyRef = useRef<string | null>(null);
   const extraSessionRef = useRef<ExtraSession | null>(null);
-  const restoreCompletedExtraTaskRef = useRef<(label: string, taskId: string) => boolean>(
-    () => false
-  );
+  const applyResolvedHomeStateRef = useRef<
+    (state: HomeState, nextDaily?: DailyState) => void
+  >(() => {});
+  const skipTaskTypingRef = useRef(false);
+  const skipPraiseTypingRef = useRef(false);
 
   // 公開版ゲート済みレベルで抽選（保存上の level と食い違わないようにする）
   const availableLevels = getAvailableTaskLevels(progress);
@@ -202,10 +202,6 @@ export default function HomeScreen() {
   const taskOpacity = useRef(new Animated.Value(0)).current;
   const taskY = useRef(new Animated.Value(8)).current;
 
-  const [canComplete, setCanComplete] = useState(false);
-  const [currentIsExtra, setCurrentIsExtra] = useState(false);
-  extraInProgressRef.current = extraInProgress;
-  currentIsExtraRef.current = currentIsExtra;
   const [praise, setPraise] = useState('');
   const [typedPraise, setTypedPraise] = useState('');
 
@@ -238,22 +234,17 @@ export default function HomeScreen() {
     return 0;
   }
 
-  const extraLimit = getExtraLimit();        // ✅ 先に計算
-  const extraCount = daily?.extraCount ?? 0; // ✅ 次に count
-
-  const canShowExtraButton =
-    ready &&
-    !!daily?.completed &&
-    !extraInProgress &&
-    extraCount < extraLimit;
-
-  // 完了ボタンは canComplete フラグだけに頼らない（focus 復元の競合で false になり得る）
-  const canSubmitComplete =
-    phase !== 'idle' &&
-    !!task &&
-    (currentIsExtra
-      ? extraInProgress
-      : daily != null && daily.completed !== true);
+  const extraLimit = getExtraLimit();
+  const extraCount =
+    homeState.status === 'idle'
+      ? 0
+      : homeState.status === 'main-active'
+        ? 0
+        : homeState.extraCount;
+  const displayedTask = displayedTaskLabel(homeState);
+  const canComplete = canCompleteHome(homeState);
+  const canShowExtraButton = ready && canShowExtraHome(homeState);
+  const canSubmitComplete = canComplete && displayedTask.length > 0;
 
   const triggerCracker = () => setCrackerTick(t => t + 1);
 
@@ -262,86 +253,40 @@ export default function HomeScreen() {
     ZenMaruGothic_700Bold,
   });
 
-  /** 未完了メインタスクを「ワンタップ直後」と同じ操作可能状態にする */
-  const restoreIncompleteMainTask = (label: string, nextDaily?: DailyState) => {
-    extraInProgressRef.current = false;
-    currentIsExtraRef.current = false;
-    lastFinishedExtraKeyRef.current = null;
+  const applyResolvedHomeState = (state: HomeState, nextDaily?: DailyState) => {
     if (nextDaily) {
       setDaily(nextDaily);
       dailyRef.current = nextDaily;
     }
-    setTask(label);
-    setTyped(label);
-    setPhase('showTask');
-    phaseRef.current = 'showTask';
-    taskRef.current = label;
-    setCanComplete(true);
-    setCurrentIsExtra(false);
+    setHomeState(state);
+    setAnimationPhase(state.status === 'idle' ? 'idle' : 'settled');
     setDescModalVisible(false);
-    setPraise('');
-    setTypedPraise('');
-    setExtraInProgress(false);
-    opRef.current = true;
+    const restoredTask = displayedTaskLabel(state);
+    const restoredPraise = displayedPraise(state);
+    skipTaskTypingRef.current =
+      state.status === 'main-active' || state.status === 'extra-active';
+    skipPraiseTypingRef.current =
+      state.status === 'main-completed' || state.status === 'day-completed';
+    setTyped(restoredTask);
+    setPraise(restoredPraise);
+    setTypedPraise(restoredPraise);
+    if (state.status === 'idle') {
+      skipTaskTypingRef.current = false;
+      skipPraiseTypingRef.current = false;
+      btnOpacity.setValue(1);
+      btnScale.setValue(1);
+      taskOpacity.setValue(0);
+      taskY.setValue(8);
+      return;
+    }
     btnOpacity.setValue(0);
     btnScale.setValue(0.95);
     taskOpacity.setValue(1);
     taskY.setValue(0);
   };
-  restoreIncompleteMainTaskRef.current = restoreIncompleteMainTask;
+  applyResolvedHomeStateRef.current = applyResolvedHomeState;
 
-  /** 追加タスク表示中のホーム復帰。daily.task は完了済みメインのままなので上書きしない */
-  const restoreIncompleteExtraTask = (labelArg?: string): boolean => {
-    const label = labelArg || taskRef.current;
-    if (!label) return false;
-    extraInProgressRef.current = true;
-    currentIsExtraRef.current = true;
-    lastFinishedExtraKeyRef.current = null;
-    setPhase('showTask');
-    phaseRef.current = 'showTask';
-    setTask(label);
-    setTyped(label);
-    taskRef.current = label;
-    setCanComplete(true);
-    setCurrentIsExtra(true);
-    setExtraInProgress(true);
-    extraInProgressRef.current = true;
-    currentIsExtraRef.current = true;
-    setDescModalVisible(false);
-    opRef.current = true;
-    btnOpacity.setValue(0);
-    btnScale.setValue(0.95);
-    taskOpacity.setValue(1);
-    taskY.setValue(0);
-    return true;
-  };
-  restoreIncompleteExtraTaskRef.current = restoreIncompleteExtraTask;
-
-  /** 完了済み追加の復元。完了ボタンは出さない */
-  const restoreCompletedExtraTask = (label: string, taskId: string): boolean => {
-    if (!label) return false;
-    extraInProgressRef.current = false;
-    currentIsExtraRef.current = false;
-    lastFinishedExtraKeyRef.current = extraCompletionKey(label, taskId);
-    setPhase('showTask');
-    phaseRef.current = 'showTask';
-    setTask(label);
-    setTyped(label);
-    taskRef.current = label;
-    setCanComplete(false);
-    setCurrentIsExtra(false);
-    setExtraInProgress(false);
-    setDescModalVisible(false);
-    opRef.current = true;
-    btnOpacity.setValue(0);
-    btnScale.setValue(0.95);
-    taskOpacity.setValue(1);
-    taskY.setValue(0);
-    return true;
-  };
-  restoreCompletedExtraTaskRef.current = restoreCompletedExtraTask;
-
-  // 今日状態を復元（アプリ起動/画面初回/タブ復帰）
+  // 今日状態を復元（通常起動 / 通知 / foreground とも同じ）
   useFocusEffect(
     useCallback(() => {
       const gen = ++homeRestoreGenRef.current;
@@ -353,12 +298,9 @@ export default function HomeScreen() {
         setReady(false);
 
         try {
-          // --- pack access init（完了前に Family Pack を未購入扱いしない）---
           await initializePackAccess();
           if (!isCurrent()) return;
 
-          // --- progress + settings ---
-          let selectedLevel: TaskLevel = 1;
           try {
             const currentProgress = await ensureUserProgress();
             if (!isCurrent()) return;
@@ -369,17 +311,14 @@ export default function HomeScreen() {
             if (!isCurrent()) return;
             const settings = normalizeUserSettings(rawSettings);
             setSelectedCharacterId(ensureOwnedCharacterId(settings.selectedCharacterId));
-            selectedLevel = normalizeAvailableLevel(settings.level, available);
-            setLevel(selectedLevel);
+            setLevel(normalizeAvailableLevel(settings.level, available));
           } catch {
             if (!isCurrent()) return;
             setProgress(DEFAULT_USER_PROGRESS);
             setLevel(1);
-            selectedLevel = 1;
           }
           if (!isCurrent()) return;
 
-          // --- premium load（もう1つやる上限のため）---
           try {
             const p = await loadPremiumState();
             if (!isCurrent()) return;
@@ -389,8 +328,8 @@ export default function HomeScreen() {
             setPremiumState(defaultPremiumState);
           }
 
-          // --- daily load ---
           const todayKey = dateKeyLocal(new Date());
+          const extraLimitNow = DEFAULT_HOME_EXTRA_LIMIT;
           const rawDaily = await readJson<unknown>(STORAGE_KEYS.daily, null);
           if (!isCurrent()) return;
 
@@ -399,56 +338,31 @@ export default function HomeScreen() {
             await writeJson(STORAGE_KEYS.daily, fresh);
             await removeKey(STORAGE_KEYS.extraSession);
             extraSessionRef.current = null;
-            extraInProgressRef.current = false;
-            currentIsExtraRef.current = false;
             lastFinishedExtraKeyRef.current = null;
             if (!isCurrent()) return;
-            setDaily(fresh);
-            setPhase('idle');
-            phaseRef.current = 'idle';
-            setTask('');
-            setTyped('');
-            setTypedPraise('');
-            setCanComplete(false);
-            setCurrentIsExtra(false);
-            setExtraInProgress(false);
-            setDescModalVisible(false);
-            btnOpacity.setValue(1);
-            btnScale.setValue(1);
-            taskOpacity.setValue(0);
-            taskY.setValue(8);
+            applyResolvedHomeStateRef.current(
+              resolveHomeState(fresh, null, todayKey, extraLimitNow),
+              fresh
+            );
             return;
           }
 
           const saved = normalizeDailyState(rawDaily, todayKey);
 
-          // ① 日付違い → fresh作成（UIも初期化）
           // recentTaskIds は日またぎ除外のためここでは消さない
           if (saved.dateKey !== todayKey) {
             const fresh = DEFAULT_DAILY_STATE(todayKey);
             await writeJson(STORAGE_KEYS.daily, fresh);
             await removeKey(STORAGE_KEYS.extraSession);
             extraSessionRef.current = null;
-            extraInProgressRef.current = false;
-            currentIsExtraRef.current = false;
             lastFinishedExtraKeyRef.current = null;
             if (!isCurrent()) return;
-            setDaily(fresh);
-            setPhase('idle');
-            phaseRef.current = 'idle';
-            setTask('');
-            setTyped('');
-            setCanComplete(false);
-            setCurrentIsExtra(false);
-            setExtraInProgress(false);
-            btnOpacity.setValue(1);
-            btnScale.setValue(1);
-            taskOpacity.setValue(0);
-            taskY.setValue(8);
+            applyResolvedHomeStateRef.current(
+              resolveHomeState(fresh, null, todayKey, extraLimitNow),
+              fresh
+            );
             return;
           }
-
-          if (!isCurrent()) return;
 
           const rawExtraSession = await readJson<unknown>(STORAGE_KEYS.extraSession, null);
           if (!isCurrent()) return;
@@ -458,204 +372,13 @@ export default function HomeScreen() {
             persistedExtra = null;
           }
           extraSessionRef.current = persistedExtra;
-          const todayExtra = isUsableExtraSession(persistedExtra, todayKey)
-            ? persistedExtra
-            : null;
-          const extraSessionUsable = todayExtra != null;
-
-          const extraInProgressNow = resolveExtraInProgressForRestore({
-            extraInProgress: extraInProgressRef.current,
-            hasFinishedExtraKey: lastFinishedExtraKeyRef.current !== null,
-            extraSessionCompleted: todayExtra?.completed === true,
-          });
-          extraInProgressRef.current = extraInProgressNow;
-
-          const memoryDaily = dailyRef.current;
-          const keepCompletedMemory =
-            !extraInProgressRef.current &&
-            memoryDaily != null &&
-            memoryDaily.dateKey === todayKey &&
-            memoryDaily.completed === true &&
-            !!memoryDaily.task;
-          const memoryIncompleteTask =
-            memoryDaily != null &&
-            memoryDaily.dateKey === todayKey &&
-            memoryDaily.completed !== true &&
-            !!memoryDaily.task
-              ? memoryDaily.task
-              : '';
-          const persistedCompleted = shouldPersistMainCompleted({
-            savedCompleted: saved.completed === true,
-            memoryCompleted: keepCompletedMemory,
-          });
-          const incompleteMainLabel = saved.completed !== true
-            ? (saved.task || memoryIncompleteTask)
-            : '';
-          const savedHasTask = !!(
-            saved.task ||
-            (keepCompletedMemory && memoryDaily?.task) ||
-            incompleteMainLabel
-          );
-
-          const restoreKind = decideHomeRestoreKind({
-            savedCompleted: persistedCompleted,
-            savedHasTask,
-            extraInProgress: extraInProgressRef.current,
-            extraSessionUsable,
-            extraSessionCompleted: todayExtra?.completed === true,
-            hasFinishedExtraKey: lastFinishedExtraKeyRef.current !== null,
-          });
-
-          // 未完了メインは extra / 完了済み経路より先に復元する。
-          // lastTaskId や stale extra 完了キーで消費扱いにしない。
-          if (
-            restoreKind === 'incomplete-main' ||
-            shouldKeepIncompleteMainTask({
-              savedCompleted: persistedCompleted,
-              savedHasTask: !!incompleteMainLabel,
-            })
-          ) {
-            if (incompleteMainLabel) {
-              const restoreDaily: DailyState = saved.task
-                ? { ...saved, completed: false }
-                : { ...saved, task: incompleteMainLabel, completed: false };
-              await writeJson(STORAGE_KEYS.daily, restoreDaily);
-              if (!isCurrent()) return;
-              restoreIncompleteMainTaskRef.current(incompleteMainLabel, restoreDaily);
-              return;
-            }
-          }
-
-          // ③ completed のときは表示復元（メインタスクは維持。追加抽選は新しい activeLevel）
-          if (restoreKind === 'incomplete-extra') {
-            await writeJson(STORAGE_KEYS.daily, saved);
-            if (!isCurrent()) return;
-            setDaily(saved);
-            dailyRef.current = saved;
-            const extraLabel =
-              todayExtra && !todayExtra.completed
-                ? todayExtra.taskLabel
-                : taskRef.current;
-            const kept = restoreIncompleteExtraTaskRef.current(extraLabel);
-            if (kept) return;
-          }
-
-          if (restoreKind === 'completed-extra' && todayExtra) {
-            await writeJson(STORAGE_KEYS.daily, saved);
-            if (!isCurrent()) return;
-            setDaily(saved);
-            dailyRef.current = saved;
-            const kept = restoreCompletedExtraTaskRef.current(
-              todayExtra.taskLabel,
-              todayExtra.taskId
-            );
-            if (kept) return;
-          }
-
-          if (
-            persistedCompleted &&
-            (restoreKind === 'completed-main' ||
-              shouldKeepCompletedMainTask({
-                savedCompleted: persistedCompleted,
-                savedHasTask: !!(saved.task || (keepCompletedMemory && memoryDaily?.task)),
-                extraInProgress: extraInProgressRef.current,
-              }))
-          ) {
-            const completedExtraLabel = shouldKeepCompletedExtraTask({
-              extraInProgress: extraInProgressRef.current,
-              hasFinishedExtraKey: lastFinishedExtraKeyRef.current !== null,
-              extraLabel: taskRef.current,
-            })
-              ? taskRef.current
-              : '';
-            const extraSession = extraInProgressRef.current || !!completedExtraLabel;
-            const coldStart = resolveColdStartHomeTask({
-              savedTask: saved.task,
-              savedCompleted: saved.completed === true || keepCompletedMemory,
-              lastTaskId: saved.lastTaskId,
-            });
-            const mainTask = keepCompletedMemory
-              ? memoryDaily!.task
-              : saved.task;
-            const keepTask = extraSession
-              ? resolveDisplayedTaskAfterHomeRestore({
-                  extraInProgress: extraInProgressRef.current,
-                  extraLabel: taskRef.current,
-                  completedExtraLabel,
-                  memoryCompleted: keepCompletedMemory,
-                  memoryTask: keepCompletedMemory ? memoryDaily!.task : '',
-                  savedCompleted: saved.completed === true,
-                  savedTask: saved.task,
-                })
-              : coldStart.task ||
-                resolveDisplayedTaskAfterHomeRestore({
-                  extraInProgress: false,
-                  extraLabel: '',
-                  completedExtraLabel: '',
-                  memoryCompleted: keepCompletedMemory,
-                  memoryTask: keepCompletedMemory ? memoryDaily!.task : '',
-                  savedCompleted: saved.completed === true,
-                  savedTask: saved.task,
-                });
-            const keepDaily: DailyState = keepCompletedMemory
-              ? { ...memoryDaily!, task: mainTask, completed: true }
-              : { ...saved, task: mainTask, completed: persistedCompleted };
-
-            await writeJson(STORAGE_KEYS.daily, keepDaily);
-            if (!isCurrent()) return;
-
-            setDaily(keepDaily);
-            dailyRef.current = keepDaily;
-            setTask(keepTask);
-            setTyped(keepTask);
-            setPhase('showTask');
-            phaseRef.current = 'showTask';
-            taskRef.current = keepTask;
-            setCanComplete(false);
-            setCurrentIsExtra(false);
-            setDescModalVisible(false);
-            setExtraInProgress(false);
-            btnOpacity.setValue(0);
-            btnScale.setValue(0.95);
-            taskOpacity.setValue(1);
-            taskY.setValue(0);
-            return;
-          }
-
-          // ③.5 未完了だが task がある → 完了まで固定（レベル変更でも再抽選しない）
-          if (
-            shouldKeepIncompleteMainTask({
-              savedCompleted: persistedCompleted,
-              savedHasTask: !!saved.task,
-            })
-          ) {
-            await writeJson(STORAGE_KEYS.daily, saved);
-            if (!isCurrent()) return;
-            restoreIncompleteMainTaskRef.current(saved.task, saved);
-            return;
-          }
 
           await writeJson(STORAGE_KEYS.daily, saved);
           if (!isCurrent()) return;
-          setDaily(saved);
-
-          // ④ 未完了かつ task も空の場合だけ、idle に戻す（ただし操作中は触らない）
-          const userAlreadyOperating =
-            opRef.current ||
-            phaseRef.current !== 'idle' ||
-            !!taskRef.current;
-
-          if (userAlreadyOperating) return;
-
-          setPhase('idle');
-          phaseRef.current = 'idle';
-          setTask('');
-          setTyped('');
-          setCanComplete(false);
-          btnOpacity.setValue(1);
-          btnScale.setValue(1);
-          taskOpacity.setValue(0);
-          taskY.setValue(8);
+          applyResolvedHomeStateRef.current(
+            resolveHomeState(saved, persistedExtra, todayKey, extraLimitNow),
+            saved
+          );
         } catch {
           // 本番ではログ出さない
         } finally {
@@ -671,58 +394,52 @@ export default function HomeScreen() {
     }, [])
   );  
 
-     // 追加でもう1つやる（dailyは触らない）
      const onExtraTap = async () => {
-      if (!daily?.completed) return;
-      if (extraInProgress) return;
-    
+      if (homeState.status !== 'main-completed') return;
+      if (!daily) return;
+
       const limit = getExtraLimit();
       const count = daily.extraCount ?? 0;
       if (count >= limit) return;
-    
-      setExtraInProgress(true);
-      extraInProgressRef.current = true;
+
       lastFinishedExtraKeyRef.current = null;
-    
-      // 先にUI初期化
+      skipTaskTypingRef.current = false;
+      skipPraiseTypingRef.current = false;
       taskOpacity.setValue(0);
       taskY.setValue(8);
-    
+      setAnimationPhase('animating');
+      setTyped('');
+      setDescModalVisible(false);
+      setPraise('');
+      setTypedPraise('');
+
       try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {}
 
+      const todayKey = dateKeyLocal(new Date());
       const recentTaskIds = normalizeRecentTaskIds(
         await readJson<unknown>(STORAGE_KEYS.recentTaskIds, null)
       );
       const picked = pickTask(activeLevel, daily.lastTaskId ?? null, recentTaskIds);
-    
-      // ✅ UI先
-      setTask(picked.label);
-      setTyped('');
-      setPhase('animating');
-      setCanComplete(true);
-      setCurrentIsExtra(true);
-      currentIsExtraRef.current = true;
-      setDescModalVisible(false);
-      setPraise('');
-      setTypedPraise('');
-    
-      const nextDaily: DailyState = { ...daily, lastTaskId: picked.id };
-      setDaily(nextDaily);
-      dailyRef.current = nextDaily;
 
+      const nextDaily: DailyState = { ...daily, lastTaskId: picked.id };
       const extraSession: ExtraSession = {
-        dateKey: dateKeyLocal(new Date()),
+        dateKey: todayKey,
         taskId: picked.id,
         taskLabel: picked.label,
         completed: false,
       };
       extraSessionRef.current = extraSession;
-    
+      setDaily(nextDaily);
+      dailyRef.current = nextDaily;
+      setHomeState(resolveHomeState(nextDaily, extraSession, todayKey, extraLimit));
+
       Animated.parallel([
         Animated.timing(taskOpacity, { toValue: 1, duration: 420, easing: Easing.out(Easing.quad), useNativeDriver: true }),
         Animated.timing(taskY, { toValue: 0, duration: 420, easing: Easing.out(Easing.quad), useNativeDriver: true }),
-      ]).start(() => setPhase('showTask'));
-    
+      ]).start(({ finished }) => {
+        if (finished) setAnimationPhase('settled');
+      });
+
       await writeJson(
         STORAGE_KEYS.recentTaskIds,
         appendRecentTaskId(recentTaskIds, picked.id)
@@ -732,27 +449,24 @@ export default function HomeScreen() {
     }; 
 
     const onTap = async () => {
-    
       if (!ready) return;
-    
+      if (homeState.status !== 'idle') return;
+
       opRef.current = true;
-    
-      // ✅ 先にUIを「見える側」に倒す（awaitより前）
-      setPhase('animating');
-      setCanComplete(true);
-      setCurrentIsExtra(false);
-      setTyped('');          // ←最優先で消す
+      skipTaskTypingRef.current = false;
+      skipPraiseTypingRef.current = false;
+      setAnimationPhase('animating');
+      setTyped('');
       setTypedPraise('');
       setPraise('');
       setDescModalVisible(false);
-
       taskOpacity.setValue(0);
       taskY.setValue(8);
-    
-      const baseDaily: DailyState = daily ?? DEFAULT_DAILY_STATE(dateKeyLocal(new Date()));
-    
+
+      const todayKey = dateKeyLocal(new Date());
+      const baseDaily: DailyState = daily ?? DEFAULT_DAILY_STATE(todayKey);
       if (baseDaily.completed) return;
-    
+
       try { await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); } catch {}
 
       const recentTaskIds = baseDaily.task
@@ -764,21 +478,20 @@ export default function HomeScreen() {
         ? null
         : pickTask(activeLevel, baseDaily.lastTaskId ?? null, recentTaskIds);
       const todayTask = baseDaily.task || picked?.label || '水をコップ1杯飲む';
-    
-      // ✅ ここで task を確定（表示は typed||task なので即見える）
-      setTask(todayTask);
-    
+
       const nextDaily: DailyState = {
         ...baseDaily,
-        dateKey: dateKeyLocal(new Date()),
+        dateKey: todayKey,
         task: todayTask,
         completed: false,
         lastTaskId: baseDaily.task ? (baseDaily.lastTaskId ?? null) : (picked?.id ?? null),
         taskLevel: baseDaily.task ? (baseDaily.taskLevel ?? activeLevel) : activeLevel,
       };
-    
+
       setDaily(nextDaily);
       dailyRef.current = nextDaily;
+      setHomeState(resolveHomeState(nextDaily, null, todayKey, extraLimit));
+
       if (picked) {
         await writeJson(
           STORAGE_KEYS.recentTaskIds,
@@ -786,25 +499,16 @@ export default function HomeScreen() {
         );
       }
       await writeJson(STORAGE_KEYS.daily, nextDaily);
-    
+
       Animated.parallel([
         Animated.timing(btnOpacity, { toValue: 0, duration: 260, easing: Easing.out(Easing.quad), useNativeDriver: true }),
         Animated.timing(btnScale,   { toValue: 0.95, duration: 260, easing: Easing.out(Easing.quad), useNativeDriver: true }),
         Animated.timing(taskOpacity,{ toValue: 1, duration: 420, easing: Easing.out(Easing.quad), useNativeDriver: true }),
         Animated.timing(taskY,      { toValue: 0, duration: 420, easing: Easing.out(Easing.quad), useNativeDriver: true }),
       ]).start(({ finished }) => {
-        if (finished) setPhase('showTask');   // ✅ finishedガード
+        if (finished) setAnimationPhase('settled');
       });
     };
-
-    // ✅ 追加：refを常に最新のstateに追従させる
-    useEffect(() => {
-      phaseRef.current = phase;
-    }, [phase]);
-
-    useEffect(() => {
-      taskRef.current = task;
-    }, [task]);
 
     useEffect(() => {
       dailyRef.current = daily;
@@ -812,7 +516,7 @@ export default function HomeScreen() {
 
     useEffect(() => {
       setDescModalVisible(false);
-    }, [task]);
+    }, [displayedTask]);
 
     const closeDescModal = useCallback(() => {
       setDescModalVisible(false);
@@ -823,20 +527,22 @@ export default function HomeScreen() {
     }, []);
 
     const onComplete = async () => {
-      if (!task || !canSubmitComplete) return;
+      if (!canSubmitComplete || !displayedTask) return;
 
-      const completingExtra = currentIsExtra;
+      const completingExtra = homeState.status === 'extra-active';
       if (completingExtra) {
-        const currentKey = extraCompletionKey(task, daily?.lastTaskId);
+        const currentKey = extraCompletionKey(displayedTask, daily?.lastTaskId);
         if (
           !canRecordExtraCompletion({
-            extraInProgress,
+            extraInProgress: true,
             lastFinishedKey: lastFinishedExtraKeyRef.current,
             currentKey,
           })
         ) {
           return;
         }
+      } else if (homeState.status !== 'main-active') {
+        return;
       } else if (!canRecordMainCompletion(daily?.completed === true)) {
         return;
       }
@@ -854,62 +560,76 @@ export default function HomeScreen() {
       }
 
       if (completingExtra) {
-        lastFinishedExtraKeyRef.current = extraCompletionKey(task, daily?.lastTaskId);
-        extraInProgressRef.current = false;
-        currentIsExtraRef.current = false;
-        setExtraInProgress(false);
-        setCurrentIsExtra(false);
+        lastFinishedExtraKeyRef.current = extraCompletionKey(
+          displayedTask,
+          daily?.lastTaskId
+        );
       }
-    
+
       opRef.current = true;
       setDescModalVisible(false);
     
       try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
 
-      // 完了フラグは履歴より先に保存する。
-      // さもないと最初のホーム復帰が未完了 snapshot を読み、レベル変更と結びついて別タスクに見える。
+      const todayKey = dateKeyLocal(new Date());
+      const msg = getRandomPraiseForCharacter(selectedCharacterId);
+      let nextDaily: DailyState;
+      let nextExtra: ExtraSession | null = extraSessionRef.current;
+
+      // 完了フラグは履歴より先に保存する。褒め言葉も同じ DailyState に残す。
       if (!completingExtra) {
-        const nextDaily: DailyState = {
-          ...(daily ?? DEFAULT_DAILY_STATE(dateKeyLocal(new Date()))),
-          dateKey: dateKeyLocal(new Date()),
-          task,
+        nextDaily = {
+          ...(daily ?? DEFAULT_DAILY_STATE(todayKey)),
+          dateKey: todayKey,
+          task: displayedTask,
           completed: true,
           completedTs: Date.now(),
           extraCount: daily?.extraCount ?? 0,
           lastTaskId: daily?.lastTaskId ?? null,
           taskLevel: daily?.taskLevel ?? activeLevel,
+          praise: msg,
         };
+        nextExtra = extraSessionRef.current;
         dailyRef.current = nextDaily;
         setDaily(nextDaily);
         await writeJson(STORAGE_KEYS.daily, nextDaily);
       } else {
         const extraSession: ExtraSession = {
-          dateKey: dateKeyLocal(new Date()),
+          dateKey: todayKey,
           taskId: extraSessionRef.current?.taskId || daily?.lastTaskId || '',
-          taskLabel: task,
+          taskLabel: displayedTask,
           completed: true,
         };
         extraSessionRef.current = extraSession;
+        nextExtra = extraSession;
         await writeJson(STORAGE_KEYS.extraSession, extraSession);
 
-        const nextDaily: DailyState = {
+        nextDaily = {
           ...(daily ?? {
-            ...DEFAULT_DAILY_STATE(dateKeyLocal(new Date())),
+            ...DEFAULT_DAILY_STATE(todayKey),
             completed: true,
           }),
           completed: true,
           extraCount: (daily?.extraCount ?? 0) + 1,
           lastTaskId: daily?.lastTaskId ?? null,
+          praise: msg,
         };
         dailyRef.current = nextDaily;
         setDaily(nextDaily);
         await writeJson(STORAGE_KEYS.daily, nextDaily);
       }
+
+      const nextState = resolveHomeState(nextDaily, nextExtra, todayKey, extraLimit);
+      skipTaskTypingRef.current = false;
+      skipPraiseTypingRef.current = false;
+      setHomeState(nextState);
+      setTyped(displayedTaskLabel(nextState));
+      setAnimationPhase('settled');
     
       // 履歴に保存（ここが唯一の addHistory）。成功時のみ進捗を加算する
       const completedTs = Date.now();
       const historySaved = await addHistory(
-        task,
+        displayedTask,
         daily?.lastTaskId,
         completingExtra,
         completedTs
@@ -924,13 +644,10 @@ export default function HomeScreen() {
         opRef.current = false;
       }
     
-      setCanComplete(false);
-    
       // ✅ 褒めタイピング：同じ文言でも必ず再生されるようにする
-      const msg = getRandomPraiseForCharacter(selectedCharacterId);
-      setTypedPraise('');          // 表示を一旦消す
-      setPraise(msg);              // 元文をセット
-      setPraiseTick(t => t + 1);   // ✅ 同じmsgでも effect を必ず走らせる
+      setTypedPraise('');
+      setPraise(msg);
+      setPraiseTick(t => t + 1);
 
       // 完了本処理の後に後付け。保存・演出を待たせない
       if (
@@ -945,24 +662,32 @@ export default function HomeScreen() {
       }
     };    
 
-// タイプ演出（showTask に入ったら毎回、確実にリセットして開始）
+// タイプ演出（未完了タスク表示のたびにリセットして開始）
 useEffect(() => {
-  if (phase !== 'showTask' || !task) return;
+  if (
+    homeState.status !== 'main-active' &&
+    homeState.status !== 'extra-active'
+  ) {
+    return;
+  }
+  if (!displayedTask) return;
+  if (skipTaskTypingRef.current) {
+    skipTaskTypingRef.current = false;
+    setTyped(displayedTask);
+    return;
+  }
 
-  // まず確実に空にする（前回の残像対策）
   setTyped('');
 
   let i = 0;
 
-  // 次フレームから刻み開始（描画順のチラつき対策）
   const raf = requestAnimationFrame(() => {
     const id = setInterval(() => {
       i += 1;
-      setTyped(task.slice(0, i));
-      if (i >= task.length) clearInterval(id);
+      setTyped(displayedTask.slice(0, i));
+      if (i >= displayedTask.length) clearInterval(id);
     }, 110);
 
-    // raf内で作ったintervalをeffectのcleanupで消せるようにする
     (cleanup as any).id = id;
   });
 
@@ -973,12 +698,17 @@ useEffect(() => {
   }
 
   return cleanup;
-}, [phase, task]);
+}, [homeState.status, displayedTask]);
 
 
 // 完了後の褒めメッセージをタイピング表示（praise が変わるたび確実にリセット）
 useEffect(() => {
   if (!praise) return;
+  if (skipPraiseTypingRef.current) {
+    skipPraiseTypingRef.current = false;
+    setTypedPraise(praise);
+    return;
+  }
 
   setTypedPraise('');
   let i = 0;
@@ -1053,7 +783,7 @@ const enableNotificationPrompt = useCallback(async () => {
   }
 }, [closeNotificationPrompt, notificationPromptBusy]);
 
-const currentDesc = getDescriptionByLabel(task);
+const currentDesc = getDescriptionByLabel(displayedTask);
 
 if (!fontsLoaded) {
   return null;
@@ -1083,8 +813,7 @@ if (!fontsLoaded) {
                 今日は1つだけでいい
               </ThemedText>
 
-              {/* ✅ ワンタップは「idle の時だけ」描画 */}
-              {phase === 'idle' && (
+              {homeState.status === 'idle' && (
                 <Animated.View
                   style={[
                     styles.overlayCenter,
@@ -1107,8 +836,8 @@ if (!fontsLoaded) {
                   </Pressable>
                 </Animated.View>
               )}
-                {/* ✅ タスク表示（説明はModal。画面内展開はしない） */}
-                {phase !== 'idle' ? (
+                {/* ✅ タスク表示。完了後も文言は残し、完了ボタンだけ出さない */}
+                {homeState.status !== 'idle' && displayedTask ? (
                   <Animated.View
                     style={[
                       styles.overlayCenter,
@@ -1184,7 +913,9 @@ if (!fontsLoaded) {
               )}
 
               {/* ✅ 画面下にキャラ＋吹き出し（背景上に重ねる） */}
-              {!!typedPraise && phase !== 'idle' && (
+              {!!typedPraise &&
+                (homeState.status === 'main-completed' ||
+                  homeState.status === 'day-completed') && (
                 <View style={styles.praiseOverlay} pointerEvents="none">
                   <PraiseCharacter characterId={selectedCharacterId} message={typedPraise} />
                 </View>
@@ -1221,7 +952,7 @@ if (!fontsLoaded) {
               タスクの説明
             </ThemedText>
             <ThemedText style={[styles.descModalTaskLabel, styles.semiBold, { color: modalText }]}>
-              {task}
+              {displayedTask}
             </ThemedText>
             <ScrollView
               style={styles.descModalScroll}

@@ -5,6 +5,7 @@ import {
   extraCompletionKey,
   resolveColdStartHomeTask,
   resolveDisplayedTaskAfterHomeRestore,
+  resolveHomeRestoreView,
   resolveExtraInProgressForRestore,
   shouldKeepCompletedExtraTask,
   shouldKeepCompletedMainTask,
@@ -13,6 +14,25 @@ import {
   shouldPickTaskOnHomeRestore,
 } from '@/src/lib/homeRestore';
 import { isUsableExtraSession, normalizeExtraSession } from '@/src/lib/extraSession';
+import {
+  canCompleteHome,
+  canShowExtraHome,
+  displayedPraise,
+  displayedTaskLabel,
+  resolveHomeState,
+  type HomeState,
+} from '@/src/lib/homeState';
+import type { DailyState } from '@/src/types/storage';
+
+function emptyDaily(dateKey: string): DailyState {
+  return {
+    dateKey,
+    task: '',
+    completed: false,
+    extraCount: 0,
+    lastTaskId: null,
+  };
+}
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(msg);
@@ -683,6 +703,414 @@ function run(): void {
       memoryCompleted: false,
     }) === false,
     'ケース4: cold start で再抽選しない'
+  );
+
+  // --- 通知 cold start / 通常起動 / foreground で同じ表示ルール ---
+  const lastOnly = resolveHomeRestoreView({
+    savedTask: '',
+    savedCompleted: false,
+    lastTaskId: 'lv2-calf-stretch-30s',
+    hasSessionMemory: false,
+  });
+  assert(lastOnly.task === '', '通知起動だけでは新しいタスクを表示しない');
+  assert(lastOnly.canComplete === false, '未完了なしなら完了不可');
+  assert(lastOnly.phase === 'idle', '未実施はワンタップ待ち');
+  assert(lastOnly.kind === 'empty', '未実施の kind は empty');
+  assert(lastOnly.task !== CALF, '通知起動でも lastTaskId を表示に使用しない');
+
+  const notifIncomplete = resolveHomeRestoreView({
+    savedTask: MAIN,
+    savedCompleted: false,
+    lastTaskId: 'lv2-calf-stretch-30s',
+    hasSessionMemory: false,
+  });
+  assert(notifIncomplete.task === MAIN, '通知起動でも保存済み未完了メインを復元');
+  assert(notifIncomplete.canComplete === true, '復元された未完了メインでは完了可能');
+  assert(notifIncomplete.phase === 'showTask', '未完了メインは表示する');
+  assert(notifIncomplete.task !== CALF, '通知起動でも lastTaskId を表示に使用しない');
+
+  const notifCompleted = resolveHomeRestoreView({
+    savedTask: MAIN,
+    savedCompleted: true,
+    lastTaskId: 'lv2-calf-stretch-30s',
+    hasSessionMemory: false,
+  });
+  assert(
+    notifCompleted.kind === 'completed-main',
+    '完了済み cold start は idle ではなく completed-main'
+  );
+  assert(notifCompleted.canComplete === false, '完了済みメインは再完了できない');
+  assert(notifCompleted.task === '', '完了済みタスクを未完了として再表示しない');
+  assert(notifCompleted.phase === 'completed', '完了済みは completed 専用 Home');
+  assert(
+    lastOnly.kind !== notifCompleted.kind,
+    '未実施と完了済みを同じ Home 状態にしない'
+  );
+  assert(
+    lastOnly.phase !== notifCompleted.phase,
+    '未実施の idle と完了済みの completed を混ぜない'
+  );
+
+  const sessionCompleted = resolveHomeRestoreView({
+    savedTask: MAIN,
+    savedCompleted: true,
+    lastTaskId: 'lv2-calf-stretch-30s',
+    hasSessionMemory: true,
+  });
+  assert(sessionCompleted.kind === 'completed-main', 'セッション中も completed-main');
+  assert(sessionCompleted.phase === 'completed', 'セッション中も完了済み専用 Home');
+  assert(sessionCompleted.task === '', 'セッション中も未完了としては再表示しない');
+  assert(sessionCompleted.canComplete === false, 'セッション中の完了済みは完了不可');
+
+  const notifIncompleteExtra = resolveHomeRestoreView({
+    savedTask: MAIN,
+    savedCompleted: true,
+    lastTaskId: 'lv2-calf-stretch-30s',
+    extraInProgress: false,
+    extraSessionUsable: true,
+    extraSessionCompleted: false,
+    extraLabel: EXTRA,
+    hasSessionMemory: false,
+  });
+  assert(notifIncompleteExtra.task === EXTRA, '通知起動でも未完了追加は復元');
+  assert(notifIncompleteExtra.canComplete === true, '未完了追加は完了可能');
+
+  const notifCompletedExtra = resolveHomeRestoreView({
+    savedTask: MAIN,
+    savedCompleted: true,
+    lastTaskId: 'lv2-calf-stretch-30s',
+    extraSessionUsable: true,
+    extraSessionCompleted: true,
+    extraLabel: EXTRA,
+    hasSessionMemory: false,
+  });
+  assert(notifCompletedExtra.kind === 'completed-extra', '完了済み追加の kind を維持');
+  assert(notifCompletedExtra.phase === 'completed', '完了済み追加も completed Home');
+  assert(notifCompletedExtra.task === '', '通知起動の完了済み追加は新規表示しない');
+  assert(notifCompletedExtra.canComplete === false, '完了済み追加 cold start は完了不可');
+
+  // --- resolveHomeState（Daily + Extra → HomeState） ---
+  const TODAY = '2026-08-30';
+  const YESTERDAY = '2026-08-29';
+  const extraLimit = 3;
+
+  const idle = resolveHomeState(emptyDaily(TODAY), null, TODAY, extraLimit);
+  assert(idle.status === 'idle', '今日未実施 → idle');
+  assert(canCompleteHome(idle) === false, 'idle は完了不可');
+  assert(canShowExtraHome(idle) === false, 'idle は追加なし');
+  assert(displayedTaskLabel(idle) === '', 'idle はタスクなし');
+
+  const lastIdOnly = resolveHomeState(
+    { ...emptyDaily(TODAY), lastTaskId: 'lv2-calf-stretch-30s' },
+    null,
+    TODAY,
+    extraLimit
+  );
+  assert(lastIdOnly.status === 'idle', 'lastTaskId だけなら idle');
+  assert(displayedTaskLabel(lastIdOnly) === '', 'lastTaskId は表示に使わない');
+
+  const mainActive = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: false,
+      lastTaskId: 'drink-water',
+      taskLevel: 1,
+    },
+    null,
+    TODAY,
+    extraLimit
+  );
+  assert(mainActive.status === 'main-active', 'メイン未完了 → main-active');
+  assert(mainActive.status === 'main-active' && mainActive.taskLabel === MAIN, '保存ラベル');
+  assert(
+    mainActive.status === 'main-active' && mainActive.taskId === null,
+    'lastTaskId を current taskId にしない'
+  );
+  assert(canCompleteHome(mainActive) === true, 'main-active → canComplete');
+  assert(canShowExtraHome(mainActive) === false, 'main-active は追加なし');
+  assert(displayedTaskLabel(mainActive) === MAIN, 'main-active の表示はメインタスク');
+
+  const mainDone = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: true,
+      extraCount: 0,
+      lastTaskId: 'lv2-calf-stretch-30s',
+    },
+    null,
+    TODAY,
+    extraLimit
+  );
+  assert(mainDone.status === 'main-completed', 'メイン完了 → main-completed');
+  assert(
+    mainDone.status === 'main-completed' && mainDone.taskId === null,
+    '完了済みでも lastTaskId を current taskId にしない'
+  );
+  assert(canCompleteHome(mainDone) === false, 'main-completed → 完了不可');
+  assert(canShowExtraHome(mainDone) === true, 'main-completed → もう1つやる');
+  assert(displayedTaskLabel(mainDone) === MAIN, 'main-completed は taskLabel を保持');
+  assert(
+    mainDone.status === 'main-completed' && mainDone.taskLabel === MAIN,
+    '再起動後も同じ taskLabel'
+  );
+
+  const extraActive = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: true,
+      extraCount: 1,
+      lastTaskId: 'lv2-glute-bridge-25',
+    },
+    {
+      dateKey: TODAY,
+      taskId: 'lv2-glute-bridge-25',
+      taskLabel: EXTRA,
+      completed: false,
+    },
+    TODAY,
+    extraLimit
+  );
+  assert(extraActive.status === 'extra-active', 'Extra未完了 → extra-active');
+  assert(
+    extraActive.status === 'extra-active' && extraActive.extraTaskId === 'lv2-glute-bridge-25',
+    'Extra の taskId は ExtraSession から取る'
+  );
+  assert(
+    extraActive.status === 'extra-active' && extraActive.mainTaskId === null,
+    'extra-active の mainTaskId に lastTaskId を入れない'
+  );
+  assert(canCompleteHome(extraActive) === true, 'extra-active → canComplete');
+  assert(canShowExtraHome(extraActive) === false, 'extra-active は追加ボタンなし');
+  assert(displayedTaskLabel(extraActive) === EXTRA, 'extra-active の表示は Extra');
+
+  const dayDone = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: true,
+      extraCount: 3,
+    },
+    {
+      dateKey: TODAY,
+      taskId: 'done-extra',
+      taskLabel: EXTRA,
+      completed: true,
+    },
+    TODAY,
+    extraLimit
+  );
+  assert(dayDone.status === 'day-completed', '上限到達 → day-completed');
+  assert(canCompleteHome(dayDone) === false, 'day-completed → 完了不可');
+  assert(canShowExtraHome(dayDone) === false, 'day-completed はもう1つやるなし');
+  assert(displayedTaskLabel(dayDone) === EXTRA, 'day-completed は最後に完了した Extra を表示');
+
+  const notifSame = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: true,
+      extraCount: 0,
+    },
+    null,
+    TODAY,
+    extraLimit
+  );
+  const coldSame = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: true,
+      extraCount: 0,
+    },
+    null,
+    TODAY,
+    extraLimit
+  );
+  assert(notifSame.status === coldSame.status, '通知起動相当でも同じ HomeState');
+  assert(notifSame.status === 'main-completed', '起動経路に依存しない');
+  assert(displayedTaskLabel(notifSame) === MAIN, '通知起動でも main-completed の taskLabel を維持');
+  assert(displayedTaskLabel(coldSame) === MAIN, 'cold start でも main-completed の taskLabel を維持');
+
+  const rolled = resolveHomeState(
+    {
+      ...emptyDaily(YESTERDAY),
+      task: MAIN,
+      completed: true,
+      lastTaskId: 'drink-water',
+    },
+    {
+      dateKey: YESTERDAY,
+      taskId: 'old-extra',
+      taskLabel: EXTRA,
+      completed: false,
+    },
+    TODAY,
+    extraLimit
+  );
+  assert(rolled.status === 'idle', '日付違い → idle');
+  assert(displayedTaskLabel(rolled) === '', '前日タスクは出さない');
+
+  const incompleteBeatsExtra = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: false,
+    },
+    {
+      dateKey: TODAY,
+      taskId: 'stale-extra',
+      taskLabel: EXTRA,
+      completed: false,
+    },
+    TODAY,
+    extraLimit
+  );
+  assert(incompleteBeatsExtra.status === 'main-active', '未完了メインは Extra より優先');
+
+  // --- 同じ保存データなら経路によらず同じ HomeState ---
+  function sameHome(a: HomeState, b: HomeState): boolean {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  const PRAISE = 'やればできるじゃん！';
+
+  // A. タップ前 → 再起動 / 通知 / foreground / 設定戻り
+  const idleSaved = emptyDaily(TODAY);
+  const idleCold = resolveHomeState(idleSaved, null, TODAY, extraLimit);
+  const idleNotif = resolveHomeState(idleSaved, null, TODAY, extraLimit);
+  const idleFg = resolveHomeState(idleSaved, null, TODAY, extraLimit);
+  const idleSettings = resolveHomeState(idleSaved, null, TODAY, extraLimit);
+  assert(idleCold.status === 'idle', 'A: タップ前は idle');
+  assert(sameHome(idleCold, idleNotif), 'A: 通知起動でも同じ idle');
+  assert(sameHome(idleCold, idleFg), 'A: foreground でも同じ idle');
+  assert(sameHome(idleCold, idleSettings), 'A: 設定戻りでも同じ idle');
+  assert(displayedTaskLabel(idleCold) === '', 'A: タップ前はタスクなし');
+  assert(displayedPraise(idleCold) === '', 'A: タップ前は褒め言葉なし');
+
+  // B / C. main-active → 再起動 / 設定 → Home
+  const mainActiveSaved = {
+    ...emptyDaily(TODAY),
+    task: MAIN,
+    completed: false,
+    lastTaskId: 'drink-water',
+    taskLevel: 1 as const,
+  };
+  const mainActiveCold = resolveHomeState(mainActiveSaved, null, TODAY, extraLimit);
+  const mainActiveSettings = resolveHomeState(mainActiveSaved, null, TODAY, extraLimit);
+  assert(mainActiveCold.status === 'main-active', 'B: 再起動後も main-active');
+  assert(
+    mainActiveCold.status === 'main-active' && mainActiveCold.taskLabel === MAIN,
+    'B: 同じメインタスク'
+  );
+  assert(sameHome(mainActiveCold, mainActiveSettings), 'C: 設定戻りでも同じ main-active');
+  assert(canCompleteHome(mainActiveCold) === true, 'B: 完了ボタン維持');
+  assert(displayedPraise(mainActiveCold) === '', 'B: 未完了中は褒め言葉なし');
+
+  // D / E. main-completed → 再起動 / 通知起動
+  const mainCompletedSaved = {
+    ...emptyDaily(TODAY),
+    task: MAIN,
+    completed: true,
+    extraCount: 0,
+    lastTaskId: 'drink-water',
+    praise: PRAISE,
+  };
+  const mainCompletedCold = resolveHomeState(mainCompletedSaved, null, TODAY, extraLimit);
+  const mainCompletedNotif = resolveHomeState(mainCompletedSaved, null, TODAY, extraLimit);
+  const mainCompletedFg = resolveHomeState(mainCompletedSaved, null, TODAY, extraLimit);
+  const mainCompletedSettings = resolveHomeState(mainCompletedSaved, null, TODAY, extraLimit);
+  assert(mainCompletedCold.status === 'main-completed', 'D: 再起動後も main-completed');
+  assert(displayedTaskLabel(mainCompletedCold) === MAIN, 'D: 完了したタスク文言を維持');
+  assert(displayedPraise(mainCompletedCold) === PRAISE, 'D: 褒め言葉を維持');
+  assert(canShowExtraHome(mainCompletedCold) === true, 'D: Extra ボタンを維持');
+  assert(canCompleteHome(mainCompletedCold) === false, 'D: 完了ボタンは出さない');
+  assert(sameHome(mainCompletedCold, mainCompletedNotif), 'E: 通知起動でも D と同じ');
+  assert(sameHome(mainCompletedCold, mainCompletedFg), 'D: foreground でも同じ');
+  assert(sameHome(mainCompletedCold, mainCompletedSettings), 'D: 設定戻りでも同じ');
+
+  const oldCompletedNoPraise = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: true,
+      extraCount: 0,
+    },
+    null,
+    TODAY,
+    extraLimit
+  );
+  assert(
+    oldCompletedNoPraise.status === 'main-completed' &&
+      oldCompletedNoPraise.praise === '',
+    '旧データに praise が無くても main-completed は維持（褒め言葉だけ空）'
+  );
+
+  // F. extra-active → 再起動
+  const extraActiveSavedDaily = {
+    ...emptyDaily(TODAY),
+    task: MAIN,
+    completed: true,
+    extraCount: 0,
+    praise: PRAISE,
+  };
+  const extraActiveSavedSession = {
+    dateKey: TODAY,
+    taskId: 'lv2-glute-bridge-25',
+    taskLabel: EXTRA,
+    completed: false,
+  };
+  const extraActiveCold = resolveHomeState(
+    extraActiveSavedDaily,
+    extraActiveSavedSession,
+    TODAY,
+    extraLimit
+  );
+  const extraActiveNotif = resolveHomeState(
+    extraActiveSavedDaily,
+    extraActiveSavedSession,
+    TODAY,
+    extraLimit
+  );
+  assert(extraActiveCold.status === 'extra-active', 'F: 再起動後も extra-active');
+  assert(displayedTaskLabel(extraActiveCold) === EXTRA, 'F: 同じ Extra を維持');
+  assert(canCompleteHome(extraActiveCold) === true, 'F: Extra 完了ボタン維持');
+  assert(displayedPraise(extraActiveCold) === '', 'F: Extra 途中は褒め言葉を出さない');
+  assert(sameHome(extraActiveCold, extraActiveNotif), 'F: 通知起動でも同じ Extra');
+
+  const extraCompletedSaved = {
+    dateKey: TODAY,
+    taskId: 'lv2-glute-bridge-25',
+    taskLabel: EXTRA,
+    completed: true,
+  };
+  const extraCompletedHome = resolveHomeState(
+    {
+      ...emptyDaily(TODAY),
+      task: MAIN,
+      completed: true,
+      extraCount: 1,
+      praise: PRAISE,
+    },
+    extraCompletedSaved,
+    TODAY,
+    extraLimit
+  );
+  assert(extraCompletedHome.status === 'main-completed', 'Extra 完了後は completed Home');
+  assert(displayedTaskLabel(extraCompletedHome) === EXTRA, 'Extra 完了後は Extra 文言を維持');
+  assert(displayedPraise(extraCompletedHome) === PRAISE, 'Extra 完了後も褒め言葉を維持');
+  assert(canShowExtraHome(extraCompletedHome) === true, 'Extra 完了後も Extra ボタン');
+
+  // G. 日付が変わったときのみ idle
+  const nextDay = resolveHomeState(mainCompletedSaved, extraActiveSavedSession, '2026-08-31', extraLimit);
+  assert(nextDay.status === 'idle', 'G: 日付変更のみ idle');
+  assert(displayedTaskLabel(nextDay) === '', 'G: 前日タスクは出さない');
+  assert(displayedPraise(nextDay) === '', 'G: 前日褒め言葉は出さない');
+  assert(
+    resolveHomeState(mainCompletedSaved, null, TODAY, extraLimit).status === 'main-completed',
+    'G: 同じ日なら completed のまま'
   );
 
   console.log('homeRestore tests passed');
